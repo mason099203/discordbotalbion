@@ -26,7 +26,7 @@ D/L 欄為 Build 選項，Bot 會搭配 C/K 欄職位顯示（例如 `tank · �
 
 1. 到 [Google Cloud Console](https://console.cloud.google.com/) 建立專案
 2. 啟用 **Google Sheets API**
-3. 建立 **Service Account**，下載 JSON 金鑰，存為 `credentials.json`
+3. 建立 **Service Account**，下載 JSON 金鑰
 4. 將 Service Account 的 email（例如 `xxx@xxx.iam.gserviceaccount.com`）加入試算表的「共用」編輯者
 
 ### 2. Discord Bot
@@ -43,8 +43,10 @@ D/L 欄為 Build 選項，Bot 會搭配 C/K 欄職位顯示（例如 `tank · �
 ```env
 DISCORD_TOKEN=你的Bot_Token
 GOOGLE_SHEET_ID=試算表網址中的ID
-GOOGLE_CREDENTIALS=credentials.json
+GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account",...}
 ```
+
+`GOOGLE_SERVICE_ACCOUNT_JSON` 為 Service Account 下載的 JSON 金鑰，整份貼成**單行**即可（`private_key` 內的 `\n` 保留）。
 
 試算表 ID 為網址中 `/d/` 與 `/edit` 之間的字串。
 
@@ -71,4 +73,4 @@ python bot.py
 
 - Bot 重啟後，舊的報名訊息按鈕會失效，需重新 `/createparty`
 - 取消報名僅能取消與自己 Discord 顯示名稱相同的欄位
-- 請勿將 `credentials.json` 與 `.env` 提交至版本控制
+- 請勿將 `.env` 提交至版本控制

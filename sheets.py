@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
 from typing import Literal
 
@@ -9,6 +11,8 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 PartyId = Literal["party1", "party2", "party3", "party4"]
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 ROLE_EMOJI: dict[str, str] = {
     "caller": "🟡",
@@ -26,6 +30,14 @@ PARTY_RANGES: dict[PartyId, dict[str, str]] = {
     "party3": {"label": "D34:D53", "value": "B34:B53", "role": "C34:C53"},
     "party4": {"label": "L34:L53", "value": "J34:J53", "role": "K34:K53"},
 }
+
+ALL_PARTIES: tuple[PartyId, ...] = ("party1", "party2", "party3", "party4")
+
+
+@dataclass
+class UserSignup:
+    party: PartyId
+    slot: Slot
 
 
 @dataclass
@@ -74,13 +86,28 @@ def signup_owned_by(value: str, user_id: int, display_name: str) -> bool:
     return name == display_name
 
 
-class GoogleSheetClient:
-    SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-
-    def __init__(self, credentials_path: str, spreadsheet_id: str):
-        creds = service_account.Credentials.from_service_account_file(
-            credentials_path, scopes=self.SCOPES
+def load_service_account_credentials(
+    credentials_path: str | None = None,
+) -> service_account.Credentials:
+    json_str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if json_str:
+        info = json.loads(json_str)
+        return service_account.Credentials.from_service_account_info(
+            info, scopes=SCOPES
         )
+
+    path = credentials_path or os.getenv("GOOGLE_CREDENTIALS", "credentials.json")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            "請在 .env 設定 GOOGLE_SERVICE_ACCOUNT_JSON，"
+            "或提供 GOOGLE_CREDENTIALS 檔案路徑"
+        )
+    return service_account.Credentials.from_service_account_file(path, scopes=SCOPES)
+
+
+class GoogleSheetClient:
+    def __init__(self, spreadsheet_id: str, credentials_path: str | None = None):
+        creds = load_service_account_credentials(credentials_path)
         self._service = build("sheets", "v4", credentials=creds)
         self.spreadsheet_id = spreadsheet_id
 
@@ -156,6 +183,15 @@ class GoogleSheetClient:
                 )
             )
         return slots
+
+    def find_user_signup(
+        self, sheet_name: str, user_id: int, display_name: str
+    ) -> UserSignup | None:
+        for party in ALL_PARTIES:
+            for slot in self.read_party_slots(sheet_name, party):
+                if signup_owned_by(slot.value, user_id, display_name):
+                    return UserSignup(party=party, slot=slot)
+        return None
 
     def write_slot_value(
         self, sheet_name: str, value_cell: str, username: str

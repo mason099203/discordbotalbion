@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 from datetime import datetime, timedelta, timezone
@@ -16,6 +17,7 @@ from sheets import (
     GoogleSheetClient,
     PartyId,
     Slot,
+    load_service_account_credentials,
     parse_signup,
     signup_owned_by,
 )
@@ -23,7 +25,6 @@ from sheets import (
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
-CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS", "credentials.json")
 
 
 def parse_spreadsheet_id(raw: str) -> str:
@@ -157,11 +158,37 @@ def parse_duration(text: str) -> timedelta | None:
     return timedelta(minutes=amount)
 
 
-def format_slots_table(slots: list[Slot]) -> str:
+SignupUserIds = dict[tuple[str, str], int]
+
+
+def slot_display_value(
+    slot: Slot,
+    sheet_name: str,
+    signup_user_ids: SignupUserIds,
+) -> str:
+    if not slot.value.strip():
+        return "(空)"
+    uid = signup_user_ids.get((sheet_name, slot.value_cell))
+    if uid:
+        return f"<@{uid}>"
+    _, parsed_uid = parse_signup(slot.value)
+    if parsed_uid:
+        return f"<@{parsed_uid}>"
+    name, _ = parse_signup(slot.value)
+    return name or "(空)"
+
+
+def format_slots_table(
+    slots: list[Slot],
+    sheet_name: str,
+    signup_user_ids: SignupUserIds,
+) -> str:
     lines = ["職位\tBuild\t報名者"]
     for s in slots:
         role = s.role or "-"
-        lines.append(f"{role}\t{s.build}\t{s.display_value}")
+        lines.append(
+            f"{role}\t{s.build}\t{slot_display_value(s, sheet_name, signup_user_ids)}"
+        )
     return "\n".join(lines)
 
 
@@ -170,6 +197,7 @@ def format_slots_embed(
     sheet_name: str,
     party: PartyId,
     closes_at: datetime | None,
+    signup_user_ids: SignupUserIds,
     closed: bool = False,
     title: str | None = None,
     note: str | None = None,
@@ -187,21 +215,21 @@ def format_slots_embed(
         color=discord.Color.red() if closed else discord.Color.green(),
     )
 
-    table = format_slots_table(slots) if slots else "無資料"
+    table = format_slots_table(slots, sheet_name, signup_user_ids) if slots else "無資料"
     embed.add_field(name="名額", value=table, inline=False)
 
     if closed:
         embed.set_footer(text="報名已關閉")
     elif closes_at:
         ts = int(closes_at.timestamp())
-        embed.set_footer(text="每人限報一個位置；重選將自動取消原報名")
+        embed.set_footer(text="同一工作表每人限報一個位置（跨 Party）；重選將自動取消原報名")
         embed.add_field(
             name="關閉時間",
             value=f"<t:{ts}:F> (<t:{ts}:R>)",
             inline=False,
         )
     else:
-        embed.set_footer(text="每人限報一個位置；重選將自動取消原報名")
+        embed.set_footer(text="同一工作表每人限報一個位置（跨 Party）；重選將自動取消原報名")
 
     return embed
 
@@ -314,39 +342,63 @@ class PartySignupView(discord.ui.View):
             return
         if slot.value:
             await interaction.response.send_message(
-                f"**{slot.label}** 已被 {slot.display_value} 報名。",
+                f"**{slot.label}** 已被 "
+                f"{slot_display_value(slot, self.sheet_name, self.bot.signup_user_ids)} 報名。",
                 ephemeral=True,
             )
             return
 
         user = interaction.user
-        existing = next(
-            (s for s in slots if signup_owned_by(s.value, user.id, user.display_name)),
-            None,
+        existing_signup = self.bot.sheets.find_user_signup(
+            self.sheet_name, user.id, user.display_name
         )
-        if existing:
-            self.bot.sheets.clear_slot_value(self.sheet_name, existing.value_cell)
+        if existing_signup:
+            self.bot.signup_user_ids.pop(
+                (self.sheet_name, existing_signup.slot.value_cell), None
+            )
+            self.bot.sheets.clear_slot_value(
+                self.sheet_name, existing_signup.slot.value_cell
+            )
 
         self.bot.sheets.write_slot_value(
             self.sheet_name,
             slot.value_cell,
             user.display_name,
         )
+        self.bot.signup_user_ids[(self.sheet_name, slot.value_cell)] = user.id
 
-        if existing and existing.index != index:
-            await interaction.response.send_message(
-                f"已取消 **{existing.label}** 的報名，改報 **{slot.label}**！",
-                ephemeral=True,
-            )
-            await self._log_activity(
-                f"🔄 {user.mention} 從 **{existing.label}** 改報 **{slot.label}**"
-            )
+        if existing_signup:
+            existing = existing_signup.slot
+            existing_party = existing_signup.party
+            if existing_party != self.party:
+                await interaction.response.send_message(
+                    f"已取消 {PARTY_LABELS[existing_party]} **{existing.label}** 的報名，"
+                    f"改報 **{slot.label}**！",
+                    ephemeral=True,
+                )
+                await self._log_activity(
+                    f"🔄 {user.mention} 從 {PARTY_LABELS[existing_party]} **{existing.label}** "
+                    f"改報 {PARTY_LABELS[self.party]} **{slot.label}**"
+                )
+            elif existing.index != index:
+                await interaction.response.send_message(
+                    f"已取消 **{existing.label}** 的報名，改報 **{slot.label}**！",
+                    ephemeral=True,
+                )
+                await self._log_activity(
+                    f"🔄 {user.mention} 從 **{existing.label}** 改報 **{slot.label}**"
+                )
+            else:
+                await interaction.response.send_message(
+                    f"已成功報名 **{slot.label}**！", ephemeral=True
+                )
+                await self._log_activity(f"✅ {user.mention} 報名 **{slot.label}**")
         else:
             await interaction.response.send_message(
                 f"已成功報名 **{slot.label}**！", ephemeral=True
             )
             await self._log_activity(f"✅ {user.mention} 報名 **{slot.label}**")
-        await self.refresh_message()
+        await self.bot.refresh_sheet_views(self.sheet_name)
 
     async def _on_leave(self, interaction: discord.Interaction) -> None:
         if self._is_expired():
@@ -366,7 +418,11 @@ class PartySignupView(discord.ui.View):
             )
             return
 
+        cancelled_display = slot_display_value(
+            slot, self.sheet_name, self.bot.signup_user_ids
+        )
         self.bot.sheets.clear_slot_value(self.sheet_name, slot.value_cell)
+        self.bot.signup_user_ids.pop((self.sheet_name, slot.value_cell), None)
         if signup_owned_by(
             slot.value, interaction.user.id, interaction.user.display_name
         ):
@@ -375,12 +431,12 @@ class PartySignupView(discord.ui.View):
                 f"❌ {interaction.user.mention} 取消 **{slot.label}** 的報名"
             )
         else:
-            msg = f"已取消 **{slot.label}**（{slot.display_value}）的報名。"
+            msg = f"已取消 **{slot.label}**（{cancelled_display}）的報名。"
             await self._log_activity(
-                f"❌ {interaction.user.mention} 取消 {slot.display_value} 的 **{slot.label}** 報名"
+                f"❌ {interaction.user.mention} 取消 {cancelled_display} 的 **{slot.label}** 報名"
             )
         await interaction.response.send_message(msg, ephemeral=True)
-        await self.refresh_message()
+        await self.bot.refresh_sheet_views(self.sheet_name)
 
     async def _on_refresh(self, interaction: discord.Interaction) -> None:
         slots = self.bot.sheets.read_party_slots(self.sheet_name, self.party)
@@ -390,6 +446,7 @@ class PartySignupView(discord.ui.View):
             self.sheet_name,
             self.party,
             self.closes_at,
+            self.bot.signup_user_ids,
             self.closed,
             self.title,
             self.note,
@@ -421,6 +478,8 @@ class PartySignupView(discord.ui.View):
         if self.message and self.message.id in self.bot.active_views:
             del self.bot.active_views[self.message.id]
 
+        self.bot.clear_signup_user_ids(self.sheet_name)
+
         if interaction.message:
             await interaction.message.delete()
 
@@ -438,6 +497,7 @@ class PartySignupView(discord.ui.View):
             self.sheet_name,
             self.party,
             self.closes_at,
+            self.bot.signup_user_ids,
             self.closed,
             self.title,
             self.note,
@@ -455,8 +515,23 @@ class PartyBot(discord.Client):
         intents = discord.Intents.default()
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
-        self.sheets = GoogleSheetClient(CREDENTIALS_PATH, GOOGLE_SHEET_ID)
+        self.sheets = GoogleSheetClient(GOOGLE_SHEET_ID)
         self.active_views: dict[int, PartySignupView] = {}
+        self.signup_user_ids: SignupUserIds = {}
+
+    def clear_signup_user_ids(self, sheet_name: str) -> None:
+        for key in list(self.signup_user_ids):
+            if key[0] == sheet_name:
+                del self.signup_user_ids[key]
+
+    async def refresh_sheet_views(self, sheet_name: str) -> None:
+        for view in self.active_views.values():
+            if view.sheet_name != sheet_name:
+                continue
+            try:
+                await view.refresh_message()
+            except discord.HTTPException:
+                pass
 
     async def setup_hook(self) -> None:
         await self.tree.sync()
@@ -544,6 +619,7 @@ async def createparty(
         sheet_name,
         party_id,
         closes_at,
+        bot.signup_user_ids,
         title=title,
         note=note,
     )
@@ -588,6 +664,10 @@ def main() -> None:
         raise SystemExit("請在 .env 設定 DISCORD_TOKEN")
     if not GOOGLE_SHEET_ID:
         raise SystemExit("請在 .env 設定 GOOGLE_SHEET_ID")
+    try:
+        load_service_account_credentials()
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        raise SystemExit(f"Google 憑證設定錯誤：{e}") from e
     bot.run(DISCORD_TOKEN)
 
 
