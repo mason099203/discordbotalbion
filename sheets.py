@@ -47,10 +47,6 @@ class Slot:
         return parse_signup(self.value)[1]
 
 
-def encode_signup(display_name: str, user_id: int) -> str:
-    return f"{display_name}|{user_id}"
-
-
 def parse_signup(value: str) -> tuple[str, int | None]:
     value = value.strip()
     if not value:

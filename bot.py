@@ -16,7 +16,6 @@ from sheets import (
     GoogleSheetClient,
     PartyId,
     Slot,
-    encode_signup,
     parse_signup,
     signup_owned_by,
 )
@@ -106,6 +105,46 @@ PARTY_LABELS = {
 }
 
 
+def get_text_channel(
+    channel: discord.abc.GuildChannel | discord.Thread | None,
+) -> discord.TextChannel | None:
+    if isinstance(channel, discord.TextChannel):
+        return channel
+    if isinstance(channel, discord.Thread):
+        return channel.parent
+    return None
+
+
+async def create_log_thread(
+    interaction: discord.Interaction,
+    sheet_name: str,
+    party_id: PartyId,
+) -> discord.Thread | None:
+    text_channel = get_text_channel(interaction.channel)
+    if text_channel is None:
+        return None
+
+    thread_name = f"報名紀錄-{PARTY_LABELS[party_id]}-{sheet_name}"
+    if len(thread_name) > 100:
+        thread_name = thread_name[:97] + "..."
+
+    try:
+        thread = await text_channel.create_thread(
+            name=thread_name,
+            type=discord.ChannelType.private_thread,
+            auto_archive_duration=10080,
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        return None
+
+    if isinstance(interaction.user, discord.Member):
+        try:
+            await thread.add_user(interaction.user)
+        except discord.HTTPException:
+            pass
+    return thread
+
+
 def parse_duration(text: str) -> timedelta | None:
     text = text.strip().lower()
     match = re.fullmatch(r"(\d+)\s*(hr|hrs|hour|hours|h|min|mins|minute|minutes|m)", text)
@@ -177,6 +216,7 @@ class PartySignupView(discord.ui.View):
         title: str | None = None,
         note: str | None = None,
         message: discord.Message | None = None,
+        log_thread: discord.Thread | None = None,
     ):
         super().__init__(timeout=None)
         self.bot = bot
@@ -186,6 +226,7 @@ class PartySignupView(discord.ui.View):
         self.title = title
         self.note = note
         self.message = message
+        self.log_thread = log_thread
         self.closed = False
         self.auto_close_task: asyncio.Task | None = None
         self._build_select()
@@ -252,6 +293,14 @@ class PartySignupView(discord.ui.View):
         delete_btn.callback = self._on_delete
         self.add_item(delete_btn)
 
+    async def _log_activity(self, content: str) -> None:
+        if not self.log_thread:
+            return
+        try:
+            await self.log_thread.send(content)
+        except discord.HTTPException:
+            pass
+
     async def _on_select(self, interaction: discord.Interaction) -> None:
         if self._is_expired():
             await interaction.response.send_message("報名已關閉。", ephemeral=True)
@@ -281,7 +330,7 @@ class PartySignupView(discord.ui.View):
         self.bot.sheets.write_slot_value(
             self.sheet_name,
             slot.value_cell,
-            encode_signup(user.display_name, user.id),
+            user.display_name,
         )
 
         if existing and existing.index != index:
@@ -289,10 +338,14 @@ class PartySignupView(discord.ui.View):
                 f"已取消 **{existing.label}** 的報名，改報 **{slot.label}**！",
                 ephemeral=True,
             )
+            await self._log_activity(
+                f"🔄 {user.mention} 從 **{existing.label}** 改報 **{slot.label}**"
+            )
         else:
             await interaction.response.send_message(
                 f"已成功報名 **{slot.label}**！", ephemeral=True
             )
+            await self._log_activity(f"✅ {user.mention} 報名 **{slot.label}**")
         await self.refresh_message()
 
     async def _on_leave(self, interaction: discord.Interaction) -> None:
@@ -318,8 +371,14 @@ class PartySignupView(discord.ui.View):
             slot.value, interaction.user.id, interaction.user.display_name
         ):
             msg = f"已取消 **{slot.label}** 的報名。"
+            await self._log_activity(
+                f"❌ {interaction.user.mention} 取消 **{slot.label}** 的報名"
+            )
         else:
             msg = f"已取消 **{slot.label}**（{slot.display_value}）的報名。"
+            await self._log_activity(
+                f"❌ {interaction.user.mention} 取消 {slot.display_value} 的 **{slot.label}** 報名"
+            )
         await interaction.response.send_message(msg, ephemeral=True)
         await self.refresh_message()
 
@@ -387,6 +446,7 @@ class PartySignupView(discord.ui.View):
 
     async def close_signup(self) -> None:
         self.closed = True
+        await self._log_activity("🔒 報名已關閉")
         await self.refresh_message()
 
 
@@ -473,6 +533,11 @@ async def createparty(
     elif sheet_created and note:
         note = f"{note}\n（已從「{SHEET_TEMPLATE_NAME}」建立新工作表）"
 
+    log_thread = await create_log_thread(interaction, sheet_name, party_id)
+    if log_thread:
+        thread_note = f"📜 動態紀錄：<#{log_thread.id}>"
+        note = f"{note}\n{thread_note}" if note else thread_note
+
     closes_at = datetime.now(timezone.utc) + duration
     embed = format_slots_embed(
         slots,
@@ -490,10 +555,24 @@ async def createparty(
         closes_at,
         title=title,
         note=note,
+        log_thread=log_thread,
     )
     message = await interaction.followup.send(embed=embed, view=view)
     view.message = message
     bot.active_views[message.id] = view
+
+    if log_thread:
+        ts = int(closes_at.timestamp())
+        await view._log_activity(
+            f"📋 {interaction.user.mention} 建立報名表單\n"
+            f"工作表：`{sheet_name}` · {PARTY_LABELS[party_id]}\n"
+            f"關閉時間：<t:{ts}:F> (<t:{ts}:R>)"
+        )
+    elif isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
+        await interaction.followup.send(
+            "⚠️ 無法建立私人討論串（請確認 Bot 有「建立私人討論串」權限），動態紀錄將不會顯示。",
+            ephemeral=True,
+        )
 
     async def auto_close():
         await asyncio.sleep(duration.total_seconds())
