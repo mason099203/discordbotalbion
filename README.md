@@ -41,20 +41,25 @@ ITEM_LOCALE=zh-TW
 
 ## 綁定監聽與回覆頻道
 
-可在 **B 頻道監聽**、在 **A 頻道回覆**：
+可同時監聽**多個頻道**，並統一回覆到指定頻道。例如同時監聽 A、B，全部回覆到 B：
 
-1. 到 **A 頻道**（或 A 的討論串）執行 `/setreply`，並選擇要監聽的 **B 頻道**
-2. 在 B 頻道貼死亡連結，Bot 會把資訊發到 A 頻道
+1. 到 **B 頻道**執行 `/setreply`，選擇要監聽的 **A 頻道**
+2. 在 **B 頻道**再執行 `/addmonitor`（或 `/setmonitor`）→ 把 B 也加入監聽
+3. 之後在 A 或 B 貼死亡連結，Bot 都會回覆到 B
 
 | 指令 | 說明 |
 |------|------|
-| `/setreply` | 在回覆頻道執行，並指定要監聽的頻道 |
-| `/setmonitor` | 僅設定監聽頻道（未設回覆時，在監聽頻道直接回覆） |
+| `/setreply` | 在回覆頻道執行，指定一個監聽頻道並設定回覆目標 |
+| `/addmonitor` | 新增監聽頻道（可重複執行） |
+| `/setmonitor` | 同 `/addmonitor`，在目前頻道新增監聽 |
+| `/removemonitor` | 移除單一監聽頻道 |
 | `/clearreply` | 取消回覆頻道，改為在監聽頻道直接回覆 |
 | `/monitorstatus` | 查看監聽與回覆頻道 |
 | `/clearmonitor` | 取消所有監聽設定 |
 
 若只用 `/setmonitor` 而未設定 `/setreply`，則在監聽頻道內直接回覆。
+
+也支援 **KillBoard#1 等 Bot 的 Embed 訊息**：若標題可點擊連到 `killboard-1.com/as/event/ID`（或官方擊殺板連結），Bot 會從 Embed 的 `url` 欄位讀取並回覆。
 
 設定會保存在 `config.json`，重啟 Bot 後仍有效。
 

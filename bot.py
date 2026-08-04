@@ -13,7 +13,7 @@ import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
-from albion_kill import fetch_kill_info, format_kill_message, parse_death_url
+from albion_kill import DeathLink, fetch_kill_info, format_kill_message, parse_death_url
 from display_settings import FIELD_LABELS, DisplaySettings
 from item_localization import LOCALE_LABELS, ensure_loaded
 from locale_settings import DEFAULT_LOCALE, locale_label, normalize_locale
@@ -33,7 +33,7 @@ FIELD_CHOICES = [
 
 @dataclass
 class MonitorSetup:
-    listen_channel_id: int
+    listen_channel_ids: list[int]
     reply_channel_id: int | None = None
 
 
@@ -52,6 +52,36 @@ def channel_ref(bot: discord.Client, channel_id: int) -> str:
     return ch.mention if ch else f"<#{channel_id}>"
 
 
+def iter_message_urls(message: discord.Message) -> list[str]:
+    urls: list[str] = []
+    if message.content:
+        urls.extend(URL_PATTERN.findall(message.content))
+    for embed in message.embeds:
+        if embed.url:
+            urls.append(embed.url)
+        if embed.description:
+            urls.extend(URL_PATTERN.findall(embed.description))
+        for field in embed.fields:
+            urls.extend(URL_PATTERN.findall(field.value))
+        if embed.footer and embed.footer.text:
+            urls.extend(URL_PATTERN.findall(embed.footer.text))
+        if embed.author and embed.author.url:
+            urls.append(embed.author.url)
+    return urls
+
+
+def find_death_link_in_message(message: discord.Message) -> DeathLink | None:
+    for url in iter_message_urls(message):
+        link = parse_death_url(url)
+        if link:
+            return link
+    return None
+
+
+def format_listen_refs(bot: discord.Client, channel_ids: list[int]) -> str:
+    return "、".join(channel_ref(bot, channel_id) for channel_id in channel_ids)
+
+
 def log_monitor_status(bot: discord.Client, config: GuildConfig) -> None:
     setups = config._monitor
     print(f"已設定 {len(setups)} 個伺服器的監聽")
@@ -61,7 +91,7 @@ def log_monitor_status(bot: discord.Client, config: GuildConfig) -> None:
     for guild_id, setup in setups.items():
         guild = bot.get_guild(guild_id)
         guild_name = guild.name if guild else f"未知({guild_id})"
-        listen_ref = channel_ref(bot, setup.listen_channel_id)
+        listen_ref = format_listen_refs(bot, setup.listen_channel_ids)
         if setup.reply_channel_id:
             reply_ref = channel_ref(bot, setup.reply_channel_id)
             print(f"  · {guild_name}：監聽 {listen_ref} → 回覆 {reply_ref}")
@@ -84,14 +114,19 @@ class GuildConfig:
         self._monitor = {}
         if "monitor" in data:
             for gid, cfg in data["monitor"].items():
+                listen_raw = cfg["listen"]
+                if isinstance(listen_raw, list):
+                    listen_ids = [int(channel_id) for channel_id in listen_raw]
+                else:
+                    listen_ids = [int(listen_raw)]
                 self._monitor[int(gid)] = MonitorSetup(
-                    listen_channel_id=int(cfg["listen"]),
+                    listen_channel_ids=listen_ids,
                     reply_channel_id=int(cfg["reply"]) if cfg.get("reply") else None,
                 )
         else:
             raw = data.get("channels", data.get("threads", {}))
             for gid, cid in raw.items():
-                self._monitor[int(gid)] = MonitorSetup(listen_channel_id=int(cid))
+                self._monitor[int(gid)] = MonitorSetup(listen_channel_ids=[int(cid)])
 
         self._display = {
             int(k): DisplaySettings.from_dict(v)
@@ -110,7 +145,7 @@ class GuildConfig:
                 {
                     "monitor": {
                         str(gid): {
-                            "listen": setup.listen_channel_id,
+                            "listen": setup.listen_channel_ids,
                             "reply": setup.reply_channel_id,
                         }
                         for gid, setup in self._monitor.items()
@@ -127,22 +162,38 @@ class GuildConfig:
         )
 
     def get_monitor(self, guild_id: int) -> MonitorSetup | None:
-        return self._monitor.get(guild_id)
+        setup = self._monitor.get(guild_id)
+        if setup is None or not setup.listen_channel_ids:
+            return None
+        return setup
 
-    def set_listen_channel(self, guild_id: int, channel_id: int) -> MonitorSetup:
+    def add_listen_channel(self, guild_id: int, channel_id: int) -> MonitorSetup:
         setup = self._monitor.get(guild_id)
         if setup:
-            setup.listen_channel_id = channel_id
+            if channel_id not in setup.listen_channel_ids:
+                setup.listen_channel_ids.append(channel_id)
         else:
-            setup = MonitorSetup(listen_channel_id=channel_id)
+            setup = MonitorSetup(listen_channel_ids=[channel_id])
             self._monitor[guild_id] = setup
         self.save()
         return setup
 
+    def remove_listen_channel(self, guild_id: int, channel_id: int) -> bool:
+        setup = self._monitor.get(guild_id)
+        if setup is None or channel_id not in setup.listen_channel_ids:
+            return False
+        setup.listen_channel_ids.remove(channel_id)
+        if not setup.listen_channel_ids:
+            self._monitor.pop(guild_id, None)
+        self.save()
+        return True
+
     def set_reply_channel(self, guild_id: int, channel_id: int) -> MonitorSetup:
         setup = self._monitor.get(guild_id)
         if not setup:
-            setup = MonitorSetup(listen_channel_id=channel_id, reply_channel_id=channel_id)
+            setup = MonitorSetup(
+                listen_channel_ids=[channel_id], reply_channel_id=channel_id
+            )
             self._monitor[guild_id] = setup
         else:
             setup.reply_channel_id = channel_id
@@ -162,17 +213,14 @@ class GuildConfig:
         self.save()
 
     def should_monitor(self, guild_id: int, channel: discord.abc.GuildChannel) -> bool:
-        setup = self._monitor.get(guild_id)
+        setup = self.get_monitor(guild_id)
         if setup is None:
             return False
-        listen_id = setup.listen_channel_id
-        if channel.id == listen_id:
+        listen_ids = set(setup.listen_channel_ids)
+        if channel.id in listen_ids:
             return True
-        if isinstance(channel, discord.Thread):
-            if channel.parent_id == listen_id:
-                return True
-            if channel.id == listen_id:
-                return True
+        if isinstance(channel, discord.Thread) and channel.parent_id in listen_ids:
+            return True
         return False
 
     def get_reply_channel_id(
@@ -244,11 +292,6 @@ class SettingsView(discord.ui.View):
         self.add_item(reset_btn)
 
     async def _on_toggle(self, interaction: discord.Interaction) -> None:
-        if not is_admin(interaction):
-            await interaction.response.send_message(
-                "需要「管理伺服器」或「管理員」權限。", ephemeral=True
-            )
-            return
         field = interaction.data["values"][0]  # type: ignore[index]
         settings = self.config.get_display(self.guild_id)
         settings.toggle(field)
@@ -265,11 +308,6 @@ class SettingsView(discord.ui.View):
         )
 
     async def _on_reset(self, interaction: discord.Interaction) -> None:
-        if not is_admin(interaction):
-            await interaction.response.send_message(
-                "需要「管理伺服器」或「管理員」權限。", ephemeral=True
-            )
-            return
         settings = self.config.reset_display(self.guild_id)
         self._build_select()
         await interaction.response.edit_message(
@@ -309,38 +347,35 @@ class DeathLinkBot(discord.Client):
         return message_channel
 
     async def on_message(self, message: discord.Message) -> None:
-        if message.author.bot or not message.guild:
+        if not message.guild:
+            return
+        if message.author.bot and message.author.id == self.user.id:
             return
 
         if not self.config.should_monitor(message.guild.id, message.channel):
             return
 
-        for url in URL_PATTERN.findall(message.content):
-            link = parse_death_url(url)
-            if link is None:
-                continue
-            settings = self.config.get_display(message.guild.id)
-            locale = self.config.get_locale(message.guild.id)
-            reply_channel = await self._get_reply_channel(message.guild, message.channel)
-            async with reply_channel.typing():  # type: ignore[union-attr]
-                info = await fetch_kill_info(link.kill_id, locale)
-            if info:
-                text = format_kill_message(info, link.official_url, settings)
-                if text:
-                    await reply_channel.send(text)  # type: ignore[union-attr]
-            else:
-                await reply_channel.send(FALLBACK_MESSAGE)  # type: ignore[union-attr]
+        if message.author.bot and not message.embeds:
             return
+
+        link = find_death_link_in_message(message)
+        if link is None:
+            return
+
+        settings = self.config.get_display(message.guild.id)
+        locale = self.config.get_locale(message.guild.id)
+        reply_channel = await self._get_reply_channel(message.guild, message.channel)
+        async with reply_channel.typing():  # type: ignore[union-attr]
+            info = await fetch_kill_info(link.kill_id, locale)
+        if info:
+            text = format_kill_message(info, link.official_url, settings)
+            if text:
+                await reply_channel.send(text)  # type: ignore[union-attr]
+        else:
+            await reply_channel.send(FALLBACK_MESSAGE)  # type: ignore[union-attr]
 
 
 bot = DeathLinkBot()
-
-
-def is_admin(interaction: discord.Interaction) -> bool:
-    if not isinstance(interaction.user, discord.Member):
-        return False
-    perms = interaction.user.guild_permissions
-    return perms.administrator or perms.manage_guild
 
 
 settings_group = app_commands.Group(
@@ -374,12 +409,6 @@ async def settings_set(
     field: app_commands.Choice[str],
     enabled: app_commands.Choice[str],
 ):
-    if not is_admin(interaction):
-        await interaction.response.send_message(
-            "需要「管理伺服器」或「管理員」權限。", ephemeral=True
-        )
-        return
-
     settings = bot.config.get_display(interaction.guild_id)  # type: ignore[arg-type]
     settings.set_field(field.value, enabled.value == "on")
     bot.config.save_display(interaction.guild_id)  # type: ignore[arg-type]
@@ -392,12 +421,6 @@ async def settings_set(
 
 @settings_group.command(name="reset", description="重設為預設顯示欄位")
 async def settings_reset(interaction: discord.Interaction) -> None:
-    if not is_admin(interaction):
-        await interaction.response.send_message(
-            "需要「管理伺服器」或「管理員」權限。", ephemeral=True
-        )
-        return
-
     settings = bot.config.reset_display(interaction.guild_id)  # type: ignore[arg-type]
     await interaction.response.send_message(
         f"已重設為預設。\n\n{settings.format_summary()}",
@@ -421,12 +444,6 @@ async def language(
     interaction: discord.Interaction,
     locale: app_commands.Choice[str],
 ) -> None:
-    if not is_admin(interaction):
-        await interaction.response.send_message(
-            "需要「管理伺服器」或「管理員」權限。", ephemeral=True
-        )
-        return
-
     selected = bot.config.set_locale(interaction.guild_id, locale.value)  # type: ignore[arg-type]
     await interaction.response.send_message(
         f"已將裝備名稱語言設為 **{locale_label(selected)}**。",
@@ -445,15 +462,9 @@ async def languagestatus(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(
     name="setmonitor",
-    description="設定監聽頻道（在此頻道偵測死亡連結）",
+    description="新增監聽頻道（在此頻道偵測死亡連結，可設定多個）",
 )
 async def setmonitor(interaction: discord.Interaction) -> None:
-    if not is_admin(interaction):
-        await interaction.response.send_message(
-            "需要「管理伺服器」或「管理員」權限。", ephemeral=True
-        )
-        return
-
     channel_id = resolve_text_channel_id(interaction.channel)  # type: ignore[arg-type]
     if channel_id is None:
         await interaction.response.send_message(
@@ -461,11 +472,13 @@ async def setmonitor(interaction: discord.Interaction) -> None:
         )
         return
 
-    bot.config.set_listen_channel(interaction.guild_id, channel_id)  # type: ignore[arg-type]
+    setup = bot.config.add_listen_channel(interaction.guild_id, channel_id)  # type: ignore[arg-type]
     log_monitor_status(bot, bot.config)
     ref = channel_ref(bot, channel_id)
+    listen_refs = format_listen_refs(bot, setup.listen_channel_ids)
     await interaction.response.send_message(
-        f"已設定監聽頻道：{ref}（含該頻道內所有討論串）",
+        f"已新增監聽頻道：{ref}（含該頻道內所有討論串）\n"
+        f"目前監聽：{listen_refs}",
         ephemeral=True,
     )
 
@@ -481,12 +494,6 @@ async def setreply(
     interaction: discord.Interaction,
     listen: discord.TextChannel,
 ) -> None:
-    if not is_admin(interaction):
-        await interaction.response.send_message(
-            "需要「管理伺服器」或「管理員」權限。", ephemeral=True
-        )
-        return
-
     reply_id = resolve_text_channel_id(interaction.channel)  # type: ignore[arg-type]
     if reply_id is None:
         await interaction.response.send_message(
@@ -495,16 +502,82 @@ async def setreply(
         return
 
     guild_id = interaction.guild_id  # type: ignore[assignment]
-    bot.config.set_listen_channel(guild_id, listen.id)
+    setup = bot.config.add_listen_channel(guild_id, listen.id)
     bot.config.set_reply_channel(guild_id, reply_id)
     log_monitor_status(bot, bot.config)
 
-    listen_ref = channel_ref(bot, listen.id)
+    listen_refs = format_listen_refs(bot, setup.listen_channel_ids)
     reply_ref = channel_ref(bot, reply_id)
     await interaction.response.send_message(
-        f"已設定回覆頻道：{reply_ref}\n監聽頻道：{listen_ref}（含該頻道內所有討論串）",
+        f"已設定回覆頻道：{reply_ref}\n"
+        f"目前監聽：{listen_refs}（含各頻道內所有討論串）",
         ephemeral=True,
     )
+
+
+@bot.tree.command(
+    name="addmonitor",
+    description="新增監聽頻道（可重複執行以監聽多個頻道）",
+)
+@app_commands.describe(channel="要新增監聽的文字頻道（未指定則為目前頻道）")
+async def addmonitor(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel | None = None,
+) -> None:
+    if channel is not None:
+        channel_id = channel.id
+    else:
+        channel_id = resolve_text_channel_id(interaction.channel)  # type: ignore[arg-type]
+        if channel_id is None:
+            await interaction.response.send_message(
+                "請在**文字頻道**或**討論串**內執行此指令，或指定要監聽的頻道。",
+                ephemeral=True,
+            )
+            return
+
+    setup = bot.config.add_listen_channel(interaction.guild_id, channel_id)  # type: ignore[arg-type]
+    log_monitor_status(bot, bot.config)
+    ref = channel_ref(bot, channel_id)
+    listen_refs = format_listen_refs(bot, setup.listen_channel_ids)
+    await interaction.response.send_message(
+        f"已新增監聽頻道：{ref}\n目前監聽：{listen_refs}",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="removemonitor",
+    description="移除單一監聽頻道",
+)
+@app_commands.describe(channel="要移除監聽的文字頻道（未指定則為目前頻道）")
+async def removemonitor(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel | None = None,
+) -> None:
+    if channel is not None:
+        channel_id = channel.id
+    else:
+        channel_id = resolve_text_channel_id(interaction.channel)  # type: ignore[arg-type]
+        if channel_id is None:
+            await interaction.response.send_message(
+                "請在**文字頻道**或**討論串**內執行此指令，或指定要移除的頻道。",
+                ephemeral=True,
+            )
+            return
+
+    if not bot.config.remove_listen_channel(interaction.guild_id, channel_id):  # type: ignore[arg-type]
+        await interaction.response.send_message("該頻道不在監聽清單中。", ephemeral=True)
+        return
+
+    log_monitor_status(bot, bot.config)
+    ref = channel_ref(bot, channel_id)
+    setup = bot.config.get_monitor(interaction.guild_id)  # type: ignore[arg-type]
+    if setup:
+        listen_refs = format_listen_refs(bot, setup.listen_channel_ids)
+        msg = f"已移除監聽頻道：{ref}\n目前監聽：{listen_refs}"
+    else:
+        msg = f"已移除監聽頻道：{ref}\n目前已無監聽頻道。"
+    await interaction.response.send_message(msg, ephemeral=True)
 
 
 @bot.tree.command(
@@ -512,12 +585,6 @@ async def setreply(
     description="取消回覆頻道設定（改為在監聽頻道內直接回覆）",
 )
 async def clearreply(interaction: discord.Interaction) -> None:
-    if not is_admin(interaction):
-        await interaction.response.send_message(
-            "需要「管理伺服器」或「管理員」權限。", ephemeral=True
-        )
-        return
-
     if not bot.config.clear_reply_channel(interaction.guild_id):  # type: ignore[arg-type]
         await interaction.response.send_message("尚未設定回覆頻道。", ephemeral=True)
         return
@@ -533,12 +600,6 @@ async def clearreply(interaction: discord.Interaction) -> None:
     description="取消監聽與回覆頻道設定",
 )
 async def clearmonitor(interaction: discord.Interaction) -> None:
-    if not is_admin(interaction):
-        await interaction.response.send_message(
-            "需要「管理伺服器」或「管理員」權限。", ephemeral=True
-        )
-        return
-
     if bot.config.get_monitor(interaction.guild_id) is None:  # type: ignore[arg-type]
         await interaction.response.send_message("尚未設定監聽頻道。", ephemeral=True)
         return
@@ -561,12 +622,12 @@ async def monitorstatus(interaction: discord.Interaction) -> None:
         )
         return
 
-    listen_ref = channel_ref(bot, setup.listen_channel_id)
+    listen_refs = format_listen_refs(bot, setup.listen_channel_ids)
     if setup.reply_channel_id:
         reply_ref = channel_ref(bot, setup.reply_channel_id)
-        msg = f"監聽頻道：{listen_ref}\n回覆頻道：{reply_ref}"
+        msg = f"監聽頻道：{listen_refs}\n回覆頻道：{reply_ref}"
     else:
-        msg = f"監聽頻道：{listen_ref}\n回覆頻道：同監聽頻道"
+        msg = f"監聽頻道：{listen_refs}\n回覆頻道：同監聽頻道"
     await interaction.response.send_message(msg, ephemeral=True)
 
 
