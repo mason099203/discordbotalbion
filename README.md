@@ -1,76 +1,103 @@
-# Discord Party Bot (Albion)
+# Albion 死亡連結 Bot
 
-透過 Google Sheet 建立 Discord 報名表單。管理員使用 slash 指令開啟表單，成員選擇位置後自動寫入 Sheet 並更新 Discord 訊息。
+監聽指定 Discord 頻道，當有人貼上 Albion 擊殺板死亡連結時，自動查詢並回覆死亡資訊。
 
-## 功能
+## 邀請 Bot 進伺服器
 
-- `/createparty`：讀取指定工作表的隊伍欄位，建立 Discord 報名表單
-- 使用者從下拉選單選擇空位 → 寫入 Google Sheet → 即時更新 Discord embed
-- 可取消自己的報名
-- 到達設定時間後自動關閉報名
+OAuth2 勾選 **`bot`**、**`applications.commands`**，Bot 權限使用：
 
-## Google Sheet 欄位對應
+**`274877974528`**
 
-| 隊伍 | 選項欄（顯示職位/Build） | 報名欄（Bot 寫入名稱） | 職位欄 |
-|------|------------------------|----------------------|--------|
-| party1 | D6:D25 | B6:B25 | C6:C25 |
-| party2 | L6:L25 | J6:J25 | K6:K25 |
-| party3 | D34:D53 | B34:B53 | C34:C53 |
-| party4 | L34:L53 | J34:J53 | K34:K53 |
+| 權限 | 用途 |
+|------|------|
+| 傳送訊息 | 回覆死亡連結 |
+| 讀取訊息歷史 | 讀取討論串內容 |
+| 在討論串中傳送訊息 | 在討論串內回覆 |
 
-D/L 欄為 Build 選項，Bot 會搭配 C/K 欄職位顯示（例如 `tank · 召喚巨劍...`）；B/J 欄由 Bot 寫入 Discord 顯示名稱。
+邀請連結格式（將 `你的CLIENT_ID` 換成 Application ID）：
 
-## 設定步驟
+```
+https://discord.com/api/oauth2/authorize?client_id=你的CLIENT_ID&permissions=274877974528&scope=bot%20applications.commands
+```
 
-### 1. Google Cloud Service Account
+若 Bot 看不到討論串訊息，可加上「檢視頻道」權限，改用 `274877975552`（+1024）。
 
-1. 到 [Google Cloud Console](https://console.cloud.google.com/) 建立專案
-2. 啟用 **Google Sheets API**
-3. 建立 **Service Account**，下載 JSON 金鑰
-4. 將 Service Account 的 email（例如 `xxx@xxx.iam.gserviceaccount.com`）加入試算表的「共用」編輯者
+## 設定
 
-### 2. Discord Bot
-
-1. 到 [Discord Developer Portal](https://discord.com/developers/applications) 建立 Application
-2. Bot 分頁建立 Bot，複製 Token
-3. 啟用 **Message Content Intent**（若需要）
-4. OAuth2 → URL Generator：勾選 `bot`、`applications.commands`，邀請 Bot 進伺服器
-
-### 3. 環境變數
-
-複製 `.env.example` 為 `.env`：
+1. 到 [Discord Developer Portal](https://discord.com/developers/applications) 建立 Bot
+2. **Bot** 分頁 → 開啟 **Message Content Intent**
+3. 使用上方邀請連結將 Bot 加入伺服器
+4. 複製 `.env.example` 為 `.env`，填入 `DISCORD_TOKEN`
 
 ```env
 DISCORD_TOKEN=你的Bot_Token
-GOOGLE_SHEET_ID=試算表網址中的ID
-GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account",...}
+DEATH_LINK_REPLY=無法取得死亡資訊
+ITEM_LOCALE=zh-TW
 ```
 
-`GOOGLE_SERVICE_ACCOUNT_JSON` 為 Service Account 下載的 JSON 金鑰，整份貼成**單行**即可（`private_key` 內的 `\n` 保留）。
+`DEATH_LINK_REPLY` 為 API 查詢失敗時的備用文字。
 
-試算表 ID 為網址中 `/d/` 與 `/edit` 之間的字串。
+`ITEM_LOCALE` 為新伺服器的預設裝備語言（`en`、`zh-TW`、`zh-CN`），預設 `zh-TW`。
 
-### 4. 安裝與執行
+## 綁定監聽與回覆頻道
+
+可在 **B 頻道監聽**、在 **A 頻道回覆**：
+
+1. 到 **A 頻道**（或 A 的討論串）執行 `/setreply`，並選擇要監聽的 **B 頻道**
+2. 在 B 頻道貼死亡連結，Bot 會把資訊發到 A 頻道
+
+| 指令 | 說明 |
+|------|------|
+| `/setreply` | 在回覆頻道執行，並指定要監聽的頻道 |
+| `/setmonitor` | 僅設定監聽頻道（未設回覆時，在監聽頻道直接回覆） |
+| `/clearreply` | 取消回覆頻道，改為在監聽頻道直接回覆 |
+| `/monitorstatus` | 查看監聽與回覆頻道 |
+| `/clearmonitor` | 取消所有監聽設定 |
+
+若只用 `/setmonitor` 而未設定 `/setreply`，則在監聽頻道內直接回覆。
+
+設定會保存在 `config.json`，重啟 Bot 後仍有效。
+
+## 顯示欄位設定
+
+| 指令 | 說明 |
+|------|------|
+| `/settings show` | 查看設定，並用下拉選單點選切換欄位 |
+| `/settings set` | 問答方式設定單一欄位（選欄位 → 選開啟/關閉） |
+| `/settings reset` | 重設為預設欄位 |
+
+可調整的欄位：死者、擊殺者、IP、**全套裝備**、死亡價值、區域、參與人數、死亡時間、官方連結。
+
+## 裝備名稱語言
+
+裝備名稱資料來自 [ao-data/ao-bin-dumps](https://github.com/ao-data/ao-bin-dumps)（首次啟動會自動下載並快取至 `data/item_names.json`）。
+
+| 指令 | 說明 |
+|------|------|
+| `/language` | 設定裝備名稱語言（English / 繁體中文 / 简体中文） |
+| `/languagestatus` | 查看目前語言設定 |
+
+預設語言可由 `.env` 的 `ITEM_LOCALE` 設定（預設 `zh-TW`）。
+
+## 安裝與執行
 
 ```bash
 pip install -r requirements.txt
 python bot.py
 ```
 
-## 使用方式
+## 支援的連結格式
+
+Bot 會自動辨識並轉換為官方擊殺板連結：
 
 ```
-/createparty sheet_name:pt party:Party 1 time:2hr
+https://albiononline.com/en/killboard/kill/1059088405
+https://albiononline.com/as/killboard/kill/497367118
+https://killboard-1.com/as/event/497367118   → 自動轉為官方連結
 ```
 
-| 參數 | 說明 | 範例 |
-|------|------|------|
-| sheet_name | 工作表分頁名稱 | `pt` |
-| party | party1 ~ party4 | Party 1 |
-| time | 關閉時間 | `2hr`、`30min`、`1h` |
+## 注意
 
-## 注意事項
-
-- Bot 重啟後，舊的報名訊息按鈕會失效，需重新 `/createparty`
-- 取消報名僅能取消與自己 Discord 顯示名稱相同的欄位
+- 可分開設定監聽頻道與回覆頻道
+- 每個伺服器一組監聽設定
 - 請勿將 `.env` 提交至版本控制

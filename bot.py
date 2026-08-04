@@ -1,4 +1,4 @@
-"""Discord Bot 主程式"""
+"""Discord Bot：監聽頻道中的 Albion 死亡連結並回覆"""
 
 from __future__ import annotations
 
@@ -6,669 +6,584 @@ import asyncio
 import json
 import os
 import re
-from datetime import datetime, timedelta, timezone
-from typing import Literal
+from dataclasses import dataclass
+from pathlib import Path
 
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
-from sheets import (
-    GoogleSheetClient,
-    PartyId,
-    Slot,
-    load_service_account_credentials,
-    parse_signup,
-    signup_owned_by,
-)
+from albion_kill import fetch_kill_info, format_kill_message, parse_death_url
+from display_settings import FIELD_LABELS, DisplaySettings
+from item_localization import LOCALE_LABELS, ensure_loaded
+from locale_settings import DEFAULT_LOCALE, locale_label, normalize_locale
 
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
+FALLBACK_MESSAGE = os.getenv("DEATH_LINK_REPLY", "無法取得死亡資訊")
+CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "config.json"))
+
+URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+
+FIELD_CHOICES = [
+    app_commands.Choice(name=label, value=key) for key, label in FIELD_LABELS.items()
+]
 
 
-def parse_spreadsheet_id(raw: str) -> str:
-    """從完整 Google Sheet 網址或純 ID 取得試算表 ID。"""
-    raw = raw.strip()
-    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", raw)
-    if match:
-        return match.group(1)
-    return raw
+@dataclass
+class MonitorSetup:
+    listen_channel_id: int
+    reply_channel_id: int | None = None
 
 
-GOOGLE_SHEET_ID = parse_spreadsheet_id(
-    os.getenv("GOOGLE_SHEET_ID", "") or os.getenv("googlesheet_id", "")
-)
-SHEET_TEMPLATE_NAME = os.getenv("SHEET_TEMPLATE_NAME", "範本")
-
-
-def parse_id_list(env_key: str) -> set[int]:
-    raw = os.getenv(env_key, "")
-    ids: set[int] = set()
-    for part in raw.replace(" ", "").split(","):
-        if part.isdigit():
-            ids.add(int(part))
-    return ids
-
-
-CANCEL_MANAGER_USER_IDS = parse_id_list("CANCEL_MANAGER_USER_IDS")
-CANCEL_MANAGER_ROLE_IDS = parse_id_list("CANCEL_MANAGER_ROLE_IDS")
-CANCEL_ALLOW_MANAGE_MESSAGES = os.getenv(
-    "CANCEL_ALLOW_MANAGE_MESSAGES", ""
-).lower() in ("1", "true", "yes")
-
-
-def can_cancel_signup(
-    interaction: discord.Interaction, signup_value: str
-) -> bool:
-    if signup_owned_by(
-        signup_value, interaction.user.id, interaction.user.display_name
-    ):
-        return True
-
-    user = interaction.user
-    if user.id in CANCEL_MANAGER_USER_IDS:
-        return True
-
-    if isinstance(user, discord.Member):
-        perms = user.guild_permissions
-        if perms.administrator:
-            return True
-        if CANCEL_ALLOW_MANAGE_MESSAGES and perms.manage_messages:
-            return True
-        if {role.id for role in user.roles} & CANCEL_MANAGER_ROLE_IDS:
-            return True
-
-    return False
-
-
-def can_manage_party(interaction: discord.Interaction) -> bool:
-    user = interaction.user
-    if user.id in CANCEL_MANAGER_USER_IDS:
-        return True
-
-    if isinstance(user, discord.Member):
-        perms = user.guild_permissions
-        if perms.administrator:
-            return True
-        if CANCEL_ALLOW_MANAGE_MESSAGES and perms.manage_messages:
-            return True
-        if {role.id for role in user.roles} & CANCEL_MANAGER_ROLE_IDS:
-            return True
-
-    return False
-
-PARTY_LABELS = {
-    "party1": "Party 1",
-    "party2": "Party 2",
-    "party3": "Party 3",
-    "party4": "Party 4",
-}
-
-
-def get_text_channel(
-    channel: discord.abc.GuildChannel | discord.Thread | None,
-) -> discord.TextChannel | None:
-    if isinstance(channel, discord.TextChannel):
-        return channel
+def resolve_text_channel_id(
+    channel: discord.abc.GuildChannel | discord.Thread,
+) -> int | None:
     if isinstance(channel, discord.Thread):
-        return channel.parent
+        return channel.parent_id
+    if isinstance(channel, discord.TextChannel):
+        return channel.id
     return None
 
 
-async def create_log_thread(
-    interaction: discord.Interaction,
-    sheet_name: str,
-    party_id: PartyId,
-) -> discord.Thread | None:
-    text_channel = get_text_channel(interaction.channel)
-    if text_channel is None:
-        return None
+def channel_ref(bot: discord.Client, channel_id: int) -> str:
+    ch = bot.get_channel(channel_id)
+    return ch.mention if ch else f"<#{channel_id}>"
 
-    thread_name = f"報名紀錄-{PARTY_LABELS[party_id]}-{sheet_name}"
-    if len(thread_name) > 100:
-        thread_name = thread_name[:97] + "..."
 
-    try:
-        thread = await text_channel.create_thread(
-            name=thread_name,
-            type=discord.ChannelType.private_thread,
-            auto_archive_duration=10080,
+def log_monitor_status(bot: discord.Client, config: GuildConfig) -> None:
+    setups = config._monitor
+    print(f"已設定 {len(setups)} 個伺服器的監聽")
+    if not setups:
+        print("  （無）")
+        return
+    for guild_id, setup in setups.items():
+        guild = bot.get_guild(guild_id)
+        guild_name = guild.name if guild else f"未知({guild_id})"
+        listen_ref = channel_ref(bot, setup.listen_channel_id)
+        if setup.reply_channel_id:
+            reply_ref = channel_ref(bot, setup.reply_channel_id)
+            print(f"  · {guild_name}：監聽 {listen_ref} → 回覆 {reply_ref}")
+        else:
+            print(f"  · {guild_name}：監聽 {listen_ref}（同頻道回覆）")
+
+
+class GuildConfig:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._monitor: dict[int, MonitorSetup] = {}
+        self._display: dict[int, DisplaySettings] = {}
+        self._locale: dict[int, str] = {}
+        self.load()
+
+    def load(self) -> None:
+        if not self.path.exists():
+            return
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        self._monitor = {}
+        if "monitor" in data:
+            for gid, cfg in data["monitor"].items():
+                self._monitor[int(gid)] = MonitorSetup(
+                    listen_channel_id=int(cfg["listen"]),
+                    reply_channel_id=int(cfg["reply"]) if cfg.get("reply") else None,
+                )
+        else:
+            raw = data.get("channels", data.get("threads", {}))
+            for gid, cid in raw.items():
+                self._monitor[int(gid)] = MonitorSetup(listen_channel_id=int(cid))
+
+        self._display = {
+            int(k): DisplaySettings.from_dict(v)
+            for k, v in data.get("display", {}).items()
+        }
+        self._locale = {}
+        for k, v in data.get("locale", {}).items():
+            try:
+                self._locale[int(k)] = normalize_locale(v)
+            except ValueError:
+                continue
+
+    def save(self) -> None:
+        self.path.write_text(
+            json.dumps(
+                {
+                    "monitor": {
+                        str(gid): {
+                            "listen": setup.listen_channel_id,
+                            "reply": setup.reply_channel_id,
+                        }
+                        for gid, setup in self._monitor.items()
+                    },
+                    "display": {
+                        str(k): v.to_dict() for k, v in self._display.items()
+                    },
+                    "locale": {str(k): v for k, v in self._locale.items()},
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
         )
-    except (discord.Forbidden, discord.HTTPException):
-        return None
 
-    if isinstance(interaction.user, discord.Member):
-        try:
-            await thread.add_user(interaction.user)
-        except discord.HTTPException:
-            pass
-    return thread
+    def get_monitor(self, guild_id: int) -> MonitorSetup | None:
+        return self._monitor.get(guild_id)
 
+    def set_listen_channel(self, guild_id: int, channel_id: int) -> MonitorSetup:
+        setup = self._monitor.get(guild_id)
+        if setup:
+            setup.listen_channel_id = channel_id
+        else:
+            setup = MonitorSetup(listen_channel_id=channel_id)
+            self._monitor[guild_id] = setup
+        self.save()
+        return setup
 
-def parse_duration(text: str) -> timedelta | None:
-    text = text.strip().lower()
-    match = re.fullmatch(r"(\d+)\s*(hr|hrs|hour|hours|h|min|mins|minute|minutes|m)", text)
-    if not match:
-        return None
-    amount = int(match.group(1))
-    unit = match.group(2)
-    if unit.startswith("h"):
-        return timedelta(hours=amount)
-    return timedelta(minutes=amount)
+    def set_reply_channel(self, guild_id: int, channel_id: int) -> MonitorSetup:
+        setup = self._monitor.get(guild_id)
+        if not setup:
+            setup = MonitorSetup(listen_channel_id=channel_id, reply_channel_id=channel_id)
+            self._monitor[guild_id] = setup
+        else:
+            setup.reply_channel_id = channel_id
+        self.save()
+        return setup
 
+    def clear_reply_channel(self, guild_id: int) -> bool:
+        setup = self._monitor.get(guild_id)
+        if not setup or setup.reply_channel_id is None:
+            return False
+        setup.reply_channel_id = None
+        self.save()
+        return True
 
-SignupUserIds = dict[tuple[str, str], int]
+    def clear_monitor(self, guild_id: int) -> None:
+        self._monitor.pop(guild_id, None)
+        self.save()
 
-
-def slot_display_value(
-    slot: Slot,
-    sheet_name: str,
-    signup_user_ids: SignupUserIds,
-) -> str:
-    if not slot.value.strip():
-        return "(空)"
-    uid = signup_user_ids.get((sheet_name, slot.value_cell))
-    if uid:
-        return f"<@{uid}>"
-    _, parsed_uid = parse_signup(slot.value)
-    if parsed_uid:
-        return f"<@{parsed_uid}>"
-    name, _ = parse_signup(slot.value)
-    return name or "(空)"
-
-
-def format_slots_table(
-    slots: list[Slot],
-    sheet_name: str,
-    signup_user_ids: SignupUserIds,
-) -> str:
-    lines = ["職位\tBuild\t報名者"]
-    for s in slots:
-        role = s.role or "-"
-        lines.append(
-            f"{role}\t{s.build}\t{slot_display_value(s, sheet_name, signup_user_ids)}"
-        )
-    return "\n".join(lines)
-
-
-def format_slots_embed(
-    slots: list[Slot],
-    sheet_name: str,
-    party: PartyId,
-    closes_at: datetime | None,
-    signup_user_ids: SignupUserIds,
-    closed: bool = False,
-    title: str | None = None,
-    note: str | None = None,
-) -> discord.Embed:
-    embed_title = title or f"{PARTY_LABELS[party]} 報名表"
-
-    desc_parts: list[str] = []
-    if note:
-        desc_parts.append(f"📌 {note}")
-    desc_parts.append(f"工作表：`{sheet_name}`")
-
-    embed = discord.Embed(
-        title=embed_title,
-        description="\n".join(desc_parts),
-        color=discord.Color.red() if closed else discord.Color.green(),
-    )
-
-    table = format_slots_table(slots, sheet_name, signup_user_ids) if slots else "無資料"
-    embed.add_field(name="名額", value=table, inline=False)
-
-    if closed:
-        embed.set_footer(text="報名已關閉")
-    elif closes_at:
-        ts = int(closes_at.timestamp())
-        embed.set_footer(text="同一工作表每人限報一個位置（跨 Party）；重選將自動取消原報名")
-        embed.add_field(
-            name="關閉時間",
-            value=f"<t:{ts}:F> (<t:{ts}:R>)",
-            inline=False,
-        )
-    else:
-        embed.set_footer(text="同一工作表每人限報一個位置（跨 Party）；重選將自動取消原報名")
-
-    return embed
-
-
-class PartySignupView(discord.ui.View):
-    def __init__(
-        self,
-        bot: "PartyBot",
-        sheet_name: str,
-        party: PartyId,
-        closes_at: datetime | None,
-        title: str | None = None,
-        note: str | None = None,
-        message: discord.Message | None = None,
-        log_thread: discord.Thread | None = None,
-    ):
-        super().__init__(timeout=None)
-        self.bot = bot
-        self.sheet_name = sheet_name
-        self.party = party
-        self.closes_at = closes_at
-        self.title = title
-        self.note = note
-        self.message = message
-        self.log_thread = log_thread
-        self.closed = False
-        self.auto_close_task: asyncio.Task | None = None
-        self._build_select()
-
-    def _is_expired(self) -> bool:
-        if self.closed:
+    def should_monitor(self, guild_id: int, channel: discord.abc.GuildChannel) -> bool:
+        setup = self._monitor.get(guild_id)
+        if setup is None:
+            return False
+        listen_id = setup.listen_channel_id
+        if channel.id == listen_id:
             return True
-        if self.closes_at and datetime.now(timezone.utc) >= self.closes_at:
-            return True
+        if isinstance(channel, discord.Thread):
+            if channel.parent_id == listen_id:
+                return True
+            if channel.id == listen_id:
+                return True
         return False
+
+    def get_reply_channel_id(
+        self, guild_id: int, message_channel: discord.abc.MessageableChannel
+    ) -> int:
+        setup = self._monitor.get(guild_id)
+        if setup and setup.reply_channel_id:
+            return setup.reply_channel_id
+        if isinstance(message_channel, discord.Thread):
+            return message_channel.parent_id or message_channel.id
+        return message_channel.id
+
+    def get_display(self, guild_id: int) -> DisplaySettings:
+        if guild_id not in self._display:
+            self._display[guild_id] = DisplaySettings.default()
+        return self._display[guild_id]
+
+    def reset_display(self, guild_id: int) -> DisplaySettings:
+        self._display[guild_id] = DisplaySettings.default()
+        self.save()
+        return self._display[guild_id]
+
+    def save_display(self, guild_id: int) -> None:
+        self.save()
+
+    def get_locale(self, guild_id: int) -> str:
+        return self._locale.get(guild_id, DEFAULT_LOCALE)
+
+    def set_locale(self, guild_id: int, locale: str) -> str:
+        locale = normalize_locale(locale)
+        self._locale[guild_id] = locale
+        self.save()
+        return locale
+
+
+class SettingsView(discord.ui.View):
+    def __init__(self, guild_id: int, config: GuildConfig):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.config = config
+        self._build_select()
 
     def _build_select(self) -> None:
         self.clear_items()
-        if not self._is_expired():
-            slots = self.bot.sheets.read_party_slots(self.sheet_name, self.party)
-            available = [s for s in slots if not s.value]
-            if available:
-                options = [
-                    discord.SelectOption(label=s.label[:100], value=str(s.index))
-                    for s in available[:25]
-                ]
-                select = discord.ui.Select(
-                    placeholder="選擇要報名的位置",
-                    options=options,
-                    custom_id=f"party_signup:{self.sheet_name}:{self.party}",
-                )
-                select.callback = self._on_select
-                self.add_item(select)
-
-            taken = [s for s in slots if s.value]
-            if taken:
-                leave_options = [
-                    discord.SelectOption(
-                        label=f"取消 {s.label} ({parse_signup(s.value)[0] or s.display_value})"[
-                            :100
-                        ],
-                        value=str(s.index),
-                    )
-                    for s in taken[:25]
-                ]
-                leave_select = discord.ui.Select(
-                    placeholder="取消報名（本人或管理員）",
-                    options=leave_options,
-                    custom_id=f"party_leave:{self.sheet_name}:{self.party}",
-                )
-                leave_select.callback = self._on_leave
-                self.add_item(leave_select)
-
-        refresh_btn = discord.ui.Button(
-            label="更新",
-            style=discord.ButtonStyle.secondary,
-            emoji="🔄",
-            custom_id=f"party_refresh:{self.sheet_name}:{self.party}",
+        settings = self.config.get_display(self.guild_id)
+        options = [
+            discord.SelectOption(
+                label=label[:100],
+                value=key,
+                description="目前：開啟" if enabled else "目前：關閉",
+            )
+            for key, label, enabled in settings.iter_fields()
+        ][:25]
+        select = discord.ui.Select(
+            placeholder="選擇要切換的欄位（點選即切換開關）",
+            options=options,
+            min_values=1,
+            max_values=1,
         )
-        refresh_btn.callback = self._on_refresh
-        self.add_item(refresh_btn)
+        select.callback = self._on_toggle
+        self.add_item(select)
 
-        delete_btn = discord.ui.Button(
-            label="刪除表單",
+        reset_btn = discord.ui.Button(
+            label="全部重設",
             style=discord.ButtonStyle.danger,
-            emoji="🗑️",
-            custom_id=f"party_delete:{self.sheet_name}:{self.party}",
+            emoji="🔄",
         )
-        delete_btn.callback = self._on_delete
-        self.add_item(delete_btn)
+        reset_btn.callback = self._on_reset
+        self.add_item(reset_btn)
 
-    async def _log_activity(self, content: str) -> None:
-        if not self.log_thread:
-            return
-        try:
-            await self.log_thread.send(content)
-        except discord.HTTPException:
-            pass
-
-    async def _on_select(self, interaction: discord.Interaction) -> None:
-        if self._is_expired():
-            await interaction.response.send_message("報名已關閉。", ephemeral=True)
-            return
-
-        index = int(interaction.data["values"][0])  # type: ignore[index]
-        slots = self.bot.sheets.read_party_slots(self.sheet_name, self.party)
-        slot = next((s for s in slots if s.index == index), None)
-        if not slot:
-            await interaction.response.send_message("找不到該位置。", ephemeral=True)
-            return
-        if slot.value:
+    async def _on_toggle(self, interaction: discord.Interaction) -> None:
+        if not is_admin(interaction):
             await interaction.response.send_message(
-                f"**{slot.label}** 已被 "
-                f"{slot_display_value(slot, self.sheet_name, self.bot.signup_user_ids)} 報名。",
-                ephemeral=True,
+                "需要「管理伺服器」或「管理員」權限。", ephemeral=True
             )
             return
-
-        user = interaction.user
-        existing_signup = self.bot.sheets.find_user_signup(
-            self.sheet_name, user.id, user.display_name
-        )
-        if existing_signup:
-            self.bot.signup_user_ids.pop(
-                (self.sheet_name, existing_signup.slot.value_cell), None
-            )
-            self.bot.sheets.clear_slot_value(
-                self.sheet_name, existing_signup.slot.value_cell
-            )
-
-        self.bot.sheets.write_slot_value(
-            self.sheet_name,
-            slot.value_cell,
-            user.display_name,
-        )
-        self.bot.signup_user_ids[(self.sheet_name, slot.value_cell)] = user.id
-
-        if existing_signup:
-            existing = existing_signup.slot
-            existing_party = existing_signup.party
-            if existing_party != self.party:
-                await interaction.response.send_message(
-                    f"已取消 {PARTY_LABELS[existing_party]} **{existing.label}** 的報名，"
-                    f"改報 **{slot.label}**！",
-                    ephemeral=True,
-                )
-                await self._log_activity(
-                    f"🔄 {user.mention} 從 {PARTY_LABELS[existing_party]} **{existing.label}** "
-                    f"改報 {PARTY_LABELS[self.party]} **{slot.label}**"
-                )
-            elif existing.index != index:
-                await interaction.response.send_message(
-                    f"已取消 **{existing.label}** 的報名，改報 **{slot.label}**！",
-                    ephemeral=True,
-                )
-                await self._log_activity(
-                    f"🔄 {user.mention} 從 **{existing.label}** 改報 **{slot.label}**"
-                )
-            else:
-                await interaction.response.send_message(
-                    f"已成功報名 **{slot.label}**！", ephemeral=True
-                )
-                await self._log_activity(f"✅ {user.mention} 報名 **{slot.label}**")
-        else:
-            await interaction.response.send_message(
-                f"已成功報名 **{slot.label}**！", ephemeral=True
-            )
-            await self._log_activity(f"✅ {user.mention} 報名 **{slot.label}**")
-        await self.bot.refresh_sheet_views(self.sheet_name)
-
-    async def _on_leave(self, interaction: discord.Interaction) -> None:
-        if self._is_expired():
-            await interaction.response.send_message("報名已關閉。", ephemeral=True)
-            return
-
-        index = int(interaction.data["values"][0])  # type: ignore[index]
-        slots = self.bot.sheets.read_party_slots(self.sheet_name, self.party)
-        slot = next((s for s in slots if s.index == index), None)
-        if not slot or not slot.value:
-            await interaction.response.send_message("找不到報名紀錄。", ephemeral=True)
-            return
-
-        if not can_cancel_signup(interaction, slot.value):
-            await interaction.response.send_message(
-                "只能取消自己的報名。", ephemeral=True
-            )
-            return
-
-        cancelled_display = slot_display_value(
-            slot, self.sheet_name, self.bot.signup_user_ids
-        )
-        self.bot.sheets.clear_slot_value(self.sheet_name, slot.value_cell)
-        self.bot.signup_user_ids.pop((self.sheet_name, slot.value_cell), None)
-        if signup_owned_by(
-            slot.value, interaction.user.id, interaction.user.display_name
-        ):
-            msg = f"已取消 **{slot.label}** 的報名。"
-            await self._log_activity(
-                f"❌ {interaction.user.mention} 取消 **{slot.label}** 的報名"
-            )
-        else:
-            msg = f"已取消 **{slot.label}**（{cancelled_display}）的報名。"
-            await self._log_activity(
-                f"❌ {interaction.user.mention} 取消 {cancelled_display} 的 **{slot.label}** 報名"
-            )
-        await interaction.response.send_message(msg, ephemeral=True)
-        await self.bot.refresh_sheet_views(self.sheet_name)
-
-    async def _on_refresh(self, interaction: discord.Interaction) -> None:
-        slots = self.bot.sheets.read_party_slots(self.sheet_name, self.party)
+        field = interaction.data["values"][0]  # type: ignore[index]
+        settings = self.config.get_display(self.guild_id)
+        settings.toggle(field)
+        self.config.save_display(self.guild_id)
         self._build_select()
-        embed = format_slots_embed(
-            slots,
-            self.sheet_name,
-            self.party,
-            self.closes_at,
-            self.bot.signup_user_ids,
-            self.closed,
-            self.title,
-            self.note,
+        label = FIELD_LABELS[field]
+        state = "開啟" if getattr(settings, field) else "關閉"
+        await interaction.response.edit_message(
+            content=settings.format_summary(),
+            view=self,
         )
-        await interaction.response.edit_message(embed=embed, view=self)
-        self.message = interaction.message
-
-    async def _on_delete(self, interaction: discord.Interaction) -> None:
-        if not can_manage_party(interaction):
-            await interaction.response.send_message(
-                "你沒有刪除表單的權限。", ephemeral=True
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        protected = {SHEET_TEMPLATE_NAME, "範本"}
-        sheet_msg = ""
-        if self.sheet_name not in protected:
-            try:
-                self.bot.sheets.delete_sheet_tab(self.sheet_name, protected)
-                sheet_msg = f"已刪除工作表 `{self.sheet_name}`。"
-            except Exception as e:
-                sheet_msg = f"工作表刪除失敗：{e}"
-
-        if self.auto_close_task and not self.auto_close_task.done():
-            self.auto_close_task.cancel()
-
-        if self.message and self.message.id in self.bot.active_views:
-            del self.bot.active_views[self.message.id]
-
-        self.bot.clear_signup_user_ids(self.sheet_name)
-
-        if interaction.message:
-            await interaction.message.delete()
-
         await interaction.followup.send(
-            f"已刪除報名表單。{sheet_msg}".strip(), ephemeral=True
+            f"已將「{label}」設為 **{state}**。", ephemeral=True
         )
 
-    async def refresh_message(self) -> None:
-        if not self.message:
+    async def _on_reset(self, interaction: discord.Interaction) -> None:
+        if not is_admin(interaction):
+            await interaction.response.send_message(
+                "需要「管理伺服器」或「管理員」權限。", ephemeral=True
+            )
             return
-        slots = self.bot.sheets.read_party_slots(self.sheet_name, self.party)
+        settings = self.config.reset_display(self.guild_id)
         self._build_select()
-        embed = format_slots_embed(
-            slots,
-            self.sheet_name,
-            self.party,
-            self.closes_at,
-            self.bot.signup_user_ids,
-            self.closed,
-            self.title,
-            self.note,
+        await interaction.response.edit_message(
+            content=settings.format_summary(),
+            view=self,
         )
-        await self.message.edit(embed=embed, view=self)
-
-    async def close_signup(self) -> None:
-        self.closed = True
-        await self._log_activity("🔒 報名已關閉")
-        await self.refresh_message()
+        await interaction.followup.send("已重設為預設顯示欄位。", ephemeral=True)
 
 
-class PartyBot(discord.Client):
-    def __init__(self):
+class DeathLinkBot(discord.Client):
+    def __init__(self) -> None:
         intents = discord.Intents.default()
+        intents.message_content = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
-        self.sheets = GoogleSheetClient(GOOGLE_SHEET_ID)
-        self.active_views: dict[int, PartySignupView] = {}
-        self.signup_user_ids: SignupUserIds = {}
-
-    def clear_signup_user_ids(self, sheet_name: str) -> None:
-        for key in list(self.signup_user_ids):
-            if key[0] == sheet_name:
-                del self.signup_user_ids[key]
-
-    async def refresh_sheet_views(self, sheet_name: str) -> None:
-        for view in self.active_views.values():
-            if view.sheet_name != sheet_name:
-                continue
-            try:
-                await view.refresh_message()
-            except discord.HTTPException:
-                pass
+        self.config = GuildConfig(CONFIG_PATH)
 
     async def setup_hook(self) -> None:
+        await asyncio.to_thread(ensure_loaded)
         await self.tree.sync()
-        print(f"已同步 {len(self.tree.get_commands())} 個 slash 指令")
 
     async def on_ready(self) -> None:
-        print(f"Bot 已上線：{self.user} (ID: {self.user.id})")
+        print(f"Bot 已上線：{self.user}")
+        log_monitor_status(self, self.config)
+
+    async def _get_reply_channel(
+        self, guild: discord.Guild, message_channel: discord.abc.MessageableChannel
+    ) -> discord.abc.MessageableChannel:
+        reply_id = self.config.get_reply_channel_id(guild.id, message_channel)
+        if reply_id == message_channel.id:
+            return message_channel
+        channel = guild.get_channel(reply_id)
+        if channel is None:
+            channel = self.get_channel(reply_id)
+        if isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return channel
+        return message_channel
+
+    async def on_message(self, message: discord.Message) -> None:
+        if message.author.bot or not message.guild:
+            return
+
+        if not self.config.should_monitor(message.guild.id, message.channel):
+            return
+
+        for url in URL_PATTERN.findall(message.content):
+            link = parse_death_url(url)
+            if link is None:
+                continue
+            settings = self.config.get_display(message.guild.id)
+            locale = self.config.get_locale(message.guild.id)
+            reply_channel = await self._get_reply_channel(message.guild, message.channel)
+            async with reply_channel.typing():  # type: ignore[union-attr]
+                info = await fetch_kill_info(link.kill_id, locale)
+            if info:
+                text = format_kill_message(info, link.official_url, settings)
+                if text:
+                    await reply_channel.send(text)  # type: ignore[union-attr]
+            else:
+                await reply_channel.send(FALLBACK_MESSAGE)  # type: ignore[union-attr]
+            return
 
 
-bot = PartyBot()
+bot = DeathLinkBot()
+
+
+def is_admin(interaction: discord.Interaction) -> bool:
+    if not isinstance(interaction.user, discord.Member):
+        return False
+    perms = interaction.user.guild_permissions
+    return perms.administrator or perms.manage_guild
+
+
+settings_group = app_commands.Group(
+    name="settings", description="調整死亡資訊顯示欄位"
+)
+
+
+@settings_group.command(name="show", description="查看目前顯示欄位設定")
+async def settings_show(interaction: discord.Interaction) -> None:
+    settings = bot.config.get_display(interaction.guild_id)  # type: ignore[arg-type]
+    view = SettingsView(interaction.guild_id, bot.config)  # type: ignore[arg-type]
+    await interaction.response.send_message(
+        settings.format_summary(), view=view, ephemeral=True
+    )
+
+
+@settings_group.command(name="set", description="設定單一欄位開關")
+@app_commands.describe(
+    field="要調整的欄位",
+    enabled="是否顯示",
+)
+@app_commands.choices(field=FIELD_CHOICES)
+@app_commands.choices(
+    enabled=[
+        app_commands.Choice(name="開啟", value="on"),
+        app_commands.Choice(name="關閉", value="off"),
+    ]
+)
+async def settings_set(
+    interaction: discord.Interaction,
+    field: app_commands.Choice[str],
+    enabled: app_commands.Choice[str],
+):
+    if not is_admin(interaction):
+        await interaction.response.send_message(
+            "需要「管理伺服器」或「管理員」權限。", ephemeral=True
+        )
+        return
+
+    settings = bot.config.get_display(interaction.guild_id)  # type: ignore[arg-type]
+    settings.set_field(field.value, enabled.value == "on")
+    bot.config.save_display(interaction.guild_id)  # type: ignore[arg-type]
+    state = "開啟" if enabled.value == "on" else "關閉"
+    await interaction.response.send_message(
+        f"已將「{field.name}」設為 **{state}**。\n\n{settings.format_summary()}",
+        ephemeral=True,
+    )
+
+
+@settings_group.command(name="reset", description="重設為預設顯示欄位")
+async def settings_reset(interaction: discord.Interaction) -> None:
+    if not is_admin(interaction):
+        await interaction.response.send_message(
+            "需要「管理伺服器」或「管理員」權限。", ephemeral=True
+        )
+        return
+
+    settings = bot.config.reset_display(interaction.guild_id)  # type: ignore[arg-type]
+    await interaction.response.send_message(
+        f"已重設為預設。\n\n{settings.format_summary()}",
+        ephemeral=True,
+    )
+
+
+bot.tree.add_command(settings_group)
+
+
+LANGUAGE_CHOICES = [
+    app_commands.Choice(name=label, value=code)
+    for code, label in LOCALE_LABELS.items()
+]
+
+
+@bot.tree.command(name="language", description="設定裝備名稱顯示語言")
+@app_commands.describe(locale="裝備名稱語言")
+@app_commands.choices(locale=LANGUAGE_CHOICES)
+async def language(
+    interaction: discord.Interaction,
+    locale: app_commands.Choice[str],
+) -> None:
+    if not is_admin(interaction):
+        await interaction.response.send_message(
+            "需要「管理伺服器」或「管理員」權限。", ephemeral=True
+        )
+        return
+
+    selected = bot.config.set_locale(interaction.guild_id, locale.value)  # type: ignore[arg-type]
+    await interaction.response.send_message(
+        f"已將裝備名稱語言設為 **{locale_label(selected)}**。",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="languagestatus", description="查看目前裝備名稱語言")
+async def languagestatus(interaction: discord.Interaction) -> None:
+    locale = bot.config.get_locale(interaction.guild_id)  # type: ignore[arg-type]
+    await interaction.response.send_message(
+        f"目前裝備名稱語言：**{locale_label(locale)}**",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(
-    name="createparty",
-    description="從 Google Sheet 建立報名表單",
+    name="setmonitor",
+    description="設定監聽頻道（在此頻道偵測死亡連結）",
+)
+async def setmonitor(interaction: discord.Interaction) -> None:
+    if not is_admin(interaction):
+        await interaction.response.send_message(
+            "需要「管理伺服器」或「管理員」權限。", ephemeral=True
+        )
+        return
+
+    channel_id = resolve_text_channel_id(interaction.channel)  # type: ignore[arg-type]
+    if channel_id is None:
+        await interaction.response.send_message(
+            "請在**文字頻道**或**討論串**內執行此指令。", ephemeral=True
+        )
+        return
+
+    bot.config.set_listen_channel(interaction.guild_id, channel_id)  # type: ignore[arg-type]
+    log_monitor_status(bot, bot.config)
+    ref = channel_ref(bot, channel_id)
+    await interaction.response.send_message(
+        f"已設定監聽頻道：{ref}（含該頻道內所有討論串）",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="setreply",
+    description="在回覆頻道設定監聽來源（死亡資訊將發送到此頻道）",
 )
 @app_commands.describe(
-    sheet_name="Google Sheet 工作表名稱",
-    party="要開啟的隊伍 (party1~party4)",
-    time="關閉時間，例如 2hr、30min",
-    title="報名表標題（選填）",
-    note="備註說明（選填）",
+    listen="要監聽的文字頻道（偵測死亡連結）",
 )
-@app_commands.choices(
-    party=[
-        app_commands.Choice(name="Party 1", value="party1"),
-        app_commands.Choice(name="Party 2", value="party2"),
-        app_commands.Choice(name="Party 3", value="party3"),
-        app_commands.Choice(name="Party 4", value="party4"),
-    ]
-)
-async def createparty(
+async def setreply(
     interaction: discord.Interaction,
-    sheet_name: str,
-    party: app_commands.Choice[str],
-    time: str,
-    title: str | None = None,
-    note: str | None = None,
-):
-    await interaction.response.defer()
-
-    duration = parse_duration(time)
-    if duration is None:
-        await interaction.followup.send(
-            "時間格式錯誤，請使用例如 `2hr`、`1h`、`30min`。", ephemeral=True
+    listen: discord.TextChannel,
+) -> None:
+    if not is_admin(interaction):
+        await interaction.response.send_message(
+            "需要「管理伺服器」或「管理員」權限。", ephemeral=True
         )
         return
 
-    party_id: PartyId = party.value  # type: ignore[assignment]
-
-    sheet_created = False
-    try:
-        sheet_created = bot.sheets.ensure_sheet_from_template(
-            sheet_name, SHEET_TEMPLATE_NAME
-        )
-        slots = bot.sheets.read_party_slots(sheet_name, party_id)
-    except Exception as e:
-        await interaction.followup.send(
-            f"讀取 Google Sheet 失敗：{e}\n"
-            f"請確認範本工作表「{SHEET_TEMPLATE_NAME}」存在，且 Service Account 有權限。",
-            ephemeral=True,
+    reply_id = resolve_text_channel_id(interaction.channel)  # type: ignore[arg-type]
+    if reply_id is None:
+        await interaction.response.send_message(
+            "請在**文字頻道**或**討論串**內執行此指令。", ephemeral=True
         )
         return
 
-    if not slots:
-        await interaction.followup.send(
-            f"在工作表 `{sheet_name}` 的 {PARTY_LABELS[party_id]} 區域找不到名額資料。",
-            ephemeral=True,
-        )
-        return
+    guild_id = interaction.guild_id  # type: ignore[assignment]
+    bot.config.set_listen_channel(guild_id, listen.id)
+    bot.config.set_reply_channel(guild_id, reply_id)
+    log_monitor_status(bot, bot.config)
 
-    if sheet_created and not note:
-        note = f"已從「{SHEET_TEMPLATE_NAME}」建立新工作表"
-    elif sheet_created and note:
-        note = f"{note}\n（已從「{SHEET_TEMPLATE_NAME}」建立新工作表）"
-
-    log_thread = await create_log_thread(interaction, sheet_name, party_id)
-    if log_thread:
-        thread_note = f"📜 動態紀錄：<#{log_thread.id}>"
-        note = f"{note}\n{thread_note}" if note else thread_note
-
-    closes_at = datetime.now(timezone.utc) + duration
-    embed = format_slots_embed(
-        slots,
-        sheet_name,
-        party_id,
-        closes_at,
-        bot.signup_user_ids,
-        title=title,
-        note=note,
+    listen_ref = channel_ref(bot, listen.id)
+    reply_ref = channel_ref(bot, reply_id)
+    await interaction.response.send_message(
+        f"已設定回覆頻道：{reply_ref}\n監聽頻道：{listen_ref}（含該頻道內所有討論串）",
+        ephemeral=True,
     )
 
-    view = PartySignupView(
-        bot,
-        sheet_name,
-        party_id,
-        closes_at,
-        title=title,
-        note=note,
-        log_thread=log_thread,
-    )
-    message = await interaction.followup.send(embed=embed, view=view)
-    view.message = message
-    bot.active_views[message.id] = view
 
-    if log_thread:
-        ts = int(closes_at.timestamp())
-        await view._log_activity(
-            f"📋 {interaction.user.mention} 建立報名表單\n"
-            f"工作表：`{sheet_name}` · {PARTY_LABELS[party_id]}\n"
-            f"關閉時間：<t:{ts}:F> (<t:{ts}:R>)"
+@bot.tree.command(
+    name="clearreply",
+    description="取消回覆頻道設定（改為在監聽頻道內直接回覆）",
+)
+async def clearreply(interaction: discord.Interaction) -> None:
+    if not is_admin(interaction):
+        await interaction.response.send_message(
+            "需要「管理伺服器」或「管理員」權限。", ephemeral=True
         )
-    elif isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
-        await interaction.followup.send(
-            "⚠️ 無法建立私人討論串（請確認 Bot 有「建立私人討論串」權限），動態紀錄將不會顯示。",
+        return
+
+    if not bot.config.clear_reply_channel(interaction.guild_id):  # type: ignore[arg-type]
+        await interaction.response.send_message("尚未設定回覆頻道。", ephemeral=True)
+        return
+
+    log_monitor_status(bot, bot.config)
+    await interaction.response.send_message(
+        "已取消回覆頻道設定，將在監聽頻道內直接回覆。", ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="clearmonitor",
+    description="取消監聽與回覆頻道設定",
+)
+async def clearmonitor(interaction: discord.Interaction) -> None:
+    if not is_admin(interaction):
+        await interaction.response.send_message(
+            "需要「管理伺服器」或「管理員」權限。", ephemeral=True
+        )
+        return
+
+    if bot.config.get_monitor(interaction.guild_id) is None:  # type: ignore[arg-type]
+        await interaction.response.send_message("尚未設定監聽頻道。", ephemeral=True)
+        return
+
+    bot.config.clear_monitor(interaction.guild_id)  # type: ignore[arg-type]
+    log_monitor_status(bot, bot.config)
+    await interaction.response.send_message("已取消所有監聽設定。", ephemeral=True)
+
+
+@bot.tree.command(
+    name="monitorstatus",
+    description="查看目前監聽與回覆頻道",
+)
+async def monitorstatus(interaction: discord.Interaction) -> None:
+    setup = bot.config.get_monitor(interaction.guild_id)  # type: ignore[arg-type]
+    if setup is None:
+        await interaction.response.send_message(
+            "尚未設定。請在回覆頻道執行 `/setreply`，並選擇要監聽的頻道。",
             ephemeral=True,
         )
+        return
 
-    async def auto_close():
-        await asyncio.sleep(duration.total_seconds())
-        if message.id in bot.active_views:
-            await view.close_signup()
-            del bot.active_views[message.id]
-
-    view.auto_close_task = asyncio.create_task(auto_close())
+    listen_ref = channel_ref(bot, setup.listen_channel_id)
+    if setup.reply_channel_id:
+        reply_ref = channel_ref(bot, setup.reply_channel_id)
+        msg = f"監聽頻道：{listen_ref}\n回覆頻道：{reply_ref}"
+    else:
+        msg = f"監聽頻道：{listen_ref}\n回覆頻道：同監聽頻道"
+    await interaction.response.send_message(msg, ephemeral=True)
 
 
 def main() -> None:
     if not DISCORD_TOKEN:
         raise SystemExit("請在 .env 設定 DISCORD_TOKEN")
-    if not GOOGLE_SHEET_ID:
-        raise SystemExit("請在 .env 設定 GOOGLE_SHEET_ID")
     try:
-        load_service_account_credentials()
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        raise SystemExit(f"Google 憑證設定錯誤：{e}") from e
-    bot.run(DISCORD_TOKEN)
+        bot.run(DISCORD_TOKEN)
+    except discord.PrivilegedIntentsRequired:
+        raise SystemExit(
+            "\n❌ 需要在 Discord Developer Portal 開啟 Message Content Intent：\n"
+            "   1. https://discord.com/developers/applications\n"
+            "   2. 選擇你的 Application（Token 必須來自同一個）\n"
+            "   3. 左側 Bot → Privileged Gateway Intents\n"
+            "   4. 開啟「MESSAGE CONTENT INTENT」\n"
+            "   5. Save Changes 後重新執行 python bot.py\n"
+        ) from None
 
 
 if __name__ == "__main__":
