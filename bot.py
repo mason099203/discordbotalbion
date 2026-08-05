@@ -1,4 +1,4 @@
-"""Discord Bot：監聽頻道中的 Albion 死亡連結並回覆"""
+"""Discord Bot：監聽頻道中的 Albion 死亡連結並回覆；含 /createparty 報名"""
 
 from __future__ import annotations
 
@@ -13,16 +13,32 @@ import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
+load_dotenv()
+
 from albion_kill import DeathLink, fetch_kill_info, format_kill_message, parse_death_url
 from display_settings import FIELD_LABELS, DisplaySettings
 from item_localization import LOCALE_LABELS, ensure_loaded
 from locale_settings import DEFAULT_LOCALE, locale_label, normalize_locale
-
-load_dotenv()
+from party import PartySignupView, SignupUserIds, register_createparty
+from sheets import GoogleSheetClient, load_service_account_credentials
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 FALLBACK_MESSAGE = os.getenv("DEATH_LINK_REPLY", "無法取得死亡資訊")
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "config.json"))
+
+
+def parse_spreadsheet_id(raw: str) -> str:
+    """從完整 Google Sheet 網址或純 ID 取得試算表 ID。"""
+    raw = raw.strip()
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", raw)
+    if match:
+        return match.group(1)
+    return raw
+
+
+GOOGLE_SHEET_ID = parse_spreadsheet_id(
+    os.getenv("GOOGLE_SHEET_ID", "") or os.getenv("googlesheet_id", "")
+)
 
 URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
@@ -324,13 +340,31 @@ class DeathLinkBot(discord.Client):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.config = GuildConfig(CONFIG_PATH)
+        self.sheets = GoogleSheetClient(GOOGLE_SHEET_ID)
+        self.active_views: dict[int, PartySignupView] = {}
+        self.signup_user_ids: SignupUserIds = {}
+
+    def clear_signup_user_ids(self, sheet_name: str) -> None:
+        for key in list(self.signup_user_ids):
+            if key[0] == sheet_name:
+                del self.signup_user_ids[key]
+
+    async def refresh_sheet_views(self, sheet_name: str) -> None:
+        for view in self.active_views.values():
+            if view.sheet_name != sheet_name:
+                continue
+            try:
+                await view.refresh_message()
+            except discord.HTTPException:
+                pass
 
     async def setup_hook(self) -> None:
         await asyncio.to_thread(ensure_loaded)
         await self.tree.sync()
+        print(f"已同步 {len(self.tree.get_commands())} 個 slash 指令")
 
     async def on_ready(self) -> None:
-        print(f"Bot 已上線：{self.user}")
+        print(f"Bot 已上線：{self.user} (ID: {self.user.id})")
         log_monitor_status(self, self.config)
 
     async def _get_reply_channel(
@@ -376,6 +410,7 @@ class DeathLinkBot(discord.Client):
 
 
 bot = DeathLinkBot()
+register_createparty(bot)
 
 
 settings_group = app_commands.Group(
@@ -634,6 +669,12 @@ async def monitorstatus(interaction: discord.Interaction) -> None:
 def main() -> None:
     if not DISCORD_TOKEN:
         raise SystemExit("請在 .env 設定 DISCORD_TOKEN")
+    if not GOOGLE_SHEET_ID:
+        raise SystemExit("請在 .env 設定 GOOGLE_SHEET_ID")
+    try:
+        load_service_account_credentials()
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        raise SystemExit(f"Google 憑證設定錯誤：{e}") from e
     try:
         bot.run(DISCORD_TOKEN)
     except discord.PrivilegedIntentsRequired:
