@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
@@ -24,6 +26,65 @@ from name_match import member_matches_game_name
 from sheets import RegearSheetClient
 
 REGEAR_TZ = ZoneInfo("Asia/Taipei")
+
+# 同時處理上限（超出則回覆稍後再試）；RSS 超過門檻也拒絕新申請
+REGEAR_MAX_CONCURRENT = max(1, int(os.getenv("REGEAR_MAX_CONCURRENT", "2")))
+REGEAR_MAX_RSS_MB = max(64, int(os.getenv("REGEAR_MAX_RSS_MB", "220")))
+BUSY_MESSAGE = "目前申請人數較多或負載偏高，請稍後再試。"
+
+_regear_active = 0
+_regear_gate = asyncio.Lock()
+
+
+def _process_rss_mb() -> float | None:
+    """目前行程 RSS（MB）；無法取得時回傳 None。"""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            GetCurrentProcess = ctypes.windll.kernel32.GetCurrentProcess
+            GetProcessMemoryInfo = ctypes.windll.psapi.GetProcessMemoryInfo
+            counters = PROCESS_MEMORY_COUNTERS()
+            counters.cb = ctypes.sizeof(counters)
+            if GetProcessMemoryInfo(
+                GetCurrentProcess(), ctypes.byref(counters), counters.cb
+            ):
+                return counters.WorkingSetSize / (1024 * 1024)
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+    try:
+        import resource
+
+        usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # Linux: KB；macOS: bytes
+        if sys.platform == "darwin":
+            return usage / (1024 * 1024)
+        return usage / 1024
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _is_memory_high() -> bool:
+    rss = _process_rss_mb()
+    if rss is None:
+        return False
+    return rss >= REGEAR_MAX_RSS_MB
 
 KILL_ID_LINE_RE = re.compile(r"Kill ID[:：]\s*(\d+)", re.IGNORECASE)
 KILL_URL_RE = re.compile(
@@ -231,6 +292,35 @@ def append_kill_id_footer(text: str, kill_id: int) -> str:
 
 
 async def process_regear_application(
+    *,
+    sheets: RegearSheetClient,
+    member: discord.Member,
+    kill_id: int,
+    locale: str,
+) -> RegearResult:
+    """含併發／記憶體閘門；忙碌時立即回覆稍後再試。"""
+    global _regear_active
+
+    async with _regear_gate:
+        if _regear_active >= REGEAR_MAX_CONCURRENT or _is_memory_high():
+            return RegearResult(False, BUSY_MESSAGE)
+        _regear_active += 1
+
+    try:
+        if _is_memory_high():
+            return RegearResult(False, BUSY_MESSAGE)
+        return await _process_regear_application_inner(
+            sheets=sheets,
+            member=member,
+            kill_id=kill_id,
+            locale=locale,
+        )
+    finally:
+        async with _regear_gate:
+            _regear_active = max(0, _regear_active - 1)
+
+
+async def _process_regear_application_inner(
     *,
     sheets: RegearSheetClient,
     member: discord.Member,

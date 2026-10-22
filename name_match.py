@@ -42,8 +42,11 @@ def member_matches_game_name(member: discord.Member, game_name: str) -> bool:
 async def find_members_by_game_name(
     guild: discord.Guild, game_name: str
 ) -> list[discord.Member]:
-    """依暱稱／顯示名尋找成員（需 Members Intent）。"""
-    if not guild.chunked:
+    """依暱稱／顯示名尋找成員（需 Members Intent）。
+
+    優先用已快取成員；大型伺服器避免強制 chunk 整服以省記憶體。
+    """
+    if not guild.chunked and len(guild.members) < 200:
         try:
             await guild.chunk(cache=True)
         except discord.HTTPException:

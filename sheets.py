@@ -110,7 +110,10 @@ def load_service_account_credentials(
 class GoogleSheetClient:
     def __init__(self, spreadsheet_id: str, credentials_path: str | None = None):
         creds = load_service_account_credentials(credentials_path)
-        self._service = build("sheets", "v4", credentials=creds)
+        # cache_discovery=False：避免 discovery 文件常駐記憶體
+        self._service = build(
+            "sheets", "v4", credentials=creds, cache_discovery=False
+        )
         self.spreadsheet_id = spreadsheet_id
 
     def _col_row_to_a1(self, col: str, row: int) -> str:

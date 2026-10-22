@@ -63,6 +63,8 @@ GOOGLE_SHEET_ID_REGEAR=你的Regear試算表ID
 
 名稱比對：有綁定則以綁定為準；無綁定則用 Discord 暱稱／顯示名。不符時會引導執行 `/bindname`。
 
+多人同時申請時有併發上限（預設 2）與記憶體門檻（預設 RSS ≥ 220MB 拒絕）；忙碌時回覆「請稍後再試」。可在 `.env` 用 `REGEAR_MAX_CONCURRENT`、`REGEAR_MAX_RSS_MB` 調整。
+
 ## 綁定監聽與回覆頻道
 
 可同時監聽**多個頻道**，並統一回覆到指定頻道。例如同時監聽 A、B，全部回覆到 B：
@@ -99,7 +101,7 @@ GOOGLE_SHEET_ID_REGEAR=你的Regear試算表ID
 
 ## 裝備名稱語言
 
-裝備名稱資料來自 [ao-data/ao-bin-dumps](https://github.com/ao-data/ao-bin-dumps)（首次啟動會自動下載並快取至 `data/item_names.json`）。
+裝備名稱資料來自 [ao-data/ao-bin-dumps](https://github.com/ao-data/ao-bin-dumps)（首次啟動下載後以 SQLite `data/item_names.db` 按需查詢，避免整表佔用記憶體）。
 
 | 指令 | 說明 |
 |------|------|

@@ -3,3 +3,5 @@ config.json
 __pycache__/
 *.pyc
 data/item_names.json
+data/item_names.db
+data/item_names.db-*

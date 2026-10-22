@@ -402,7 +402,8 @@ class DeathLinkBot(discord.Client):
                 pass
 
     async def setup_hook(self) -> None:
-        await asyncio.to_thread(ensure_loaded)
+        # 背景建立／開啟 SQLite（不把整份名稱表載入 RAM）
+        asyncio.create_task(asyncio.to_thread(ensure_loaded))
         self.add_view(RegearApplyView(self))
         if self.regear_sheets is not None:
             try:
