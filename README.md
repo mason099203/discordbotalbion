@@ -117,6 +117,11 @@ pip install -r requirements.txt
 python bot.py
 ```
 
+### 託管環境建議
+
+- 請使用 **Python 3.11 或 3.12**（勿用 3.14；目前部分原生套件在 3.14 上較不穩，可能出現 `corrupted size vs. prev_size` / exit 134）。
+- 記憶體建議 ≥ 256MB；已內建 Regear 併發與 RSS 閘門。
+
 ## 支援的連結格式
 
 Bot 會自動辨識並轉換為官方擊殺板連結：

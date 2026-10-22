@@ -372,14 +372,25 @@ class DeathLinkBot(discord.Client):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.config = GuildConfig(CONFIG_PATH)
-        self.sheets = GoogleSheetClient(GOOGLE_SHEET_ID)
-        self.regear_sheets: RegearSheetClient | None = (
-            RegearSheetClient(GOOGLE_SHEET_ID_REGEAR)
-            if GOOGLE_SHEET_ID_REGEAR
-            else None
-        )
+        # 延遲建立 Sheets client，降低啟動時原生函式庫壓力
+        self._sheets: GoogleSheetClient | None = None
+        self._regear_sheets: RegearSheetClient | None = None
         self.active_views: dict[int, PartySignupView] = {}
         self.signup_user_ids: SignupUserIds = {}
+
+    @property
+    def sheets(self) -> GoogleSheetClient:
+        if self._sheets is None:
+            self._sheets = GoogleSheetClient(GOOGLE_SHEET_ID)
+        return self._sheets
+
+    @property
+    def regear_sheets(self) -> RegearSheetClient | None:
+        if not GOOGLE_SHEET_ID_REGEAR:
+            return None
+        if self._regear_sheets is None:
+            self._regear_sheets = RegearSheetClient(GOOGLE_SHEET_ID_REGEAR)
+        return self._regear_sheets
 
     def get_locale(self, guild_id: int) -> str:
         return self.config.get_locale(guild_id)
@@ -402,12 +413,19 @@ class DeathLinkBot(discord.Client):
                 pass
 
     async def setup_hook(self) -> None:
-        # 背景建立／開啟 SQLite（不把整份名稱表載入 RAM）
-        asyncio.create_task(asyncio.to_thread(ensure_loaded))
+        # 啟動時同步初始化 SQLite，避免與首次查詢競態造成原生層崩潰
+        try:
+            await asyncio.to_thread(ensure_loaded)
+        except Exception as e:  # noqa: BLE001
+            print(f"警告：裝備名稱資料庫初始化失敗：{e}")
         self.add_view(RegearApplyView(self))
-        if self.regear_sheets is not None:
+        if GOOGLE_SHEET_ID_REGEAR:
             try:
-                await asyncio.to_thread(self.regear_sheets.ensure_bindings_sheet)
+                await asyncio.to_thread(
+                    lambda: self.regear_sheets.ensure_bindings_sheet()
+                    if self.regear_sheets
+                    else None
+                )
                 print("Regear bindings 分頁已就緒")
             except Exception as e:  # noqa: BLE001
                 print(f"警告：無法初始化 Regear bindings 分頁：{e}")
