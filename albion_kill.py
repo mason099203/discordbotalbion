@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from display_settings import DisplaySettings
-from item_localization import format_item_name
+from item_localization import format_item_name, format_item_tier
 
 ALBION_URL_PATTERN = re.compile(
     r"https?://(?:www\.)?albiononline\.com(?:/([a-z]{2}))?/killboard/kill/(\d+)",
@@ -82,6 +82,16 @@ EQUIPMENT_SLOTS: tuple[tuple[str, str], ...] = (
     # ("Food", "食物"),
 )
 
+# Regear 試算表／公開回覆：不含坐騎
+REGEAR_EQUIPMENT_SLOTS: tuple[tuple[str, str], ...] = (
+    ("MainHand", "主手"),
+    ("OffHand", "副手"),
+    ("Head", "頭"),
+    ("Armor", "身"),
+    ("Shoes", "鞋"),
+    ("Cape", "披風"),
+)
+
 
 @dataclass
 class DeathLink:
@@ -106,10 +116,19 @@ class KillInfo:
     kill_area: str
     timestamp: datetime | None
     participants: int
+    victim_equipment_raw: dict | None = None
 
 
 def format_item(type_id: str, locale: str = "en") -> str:
     return format_item_name(type_id, locale)
+
+
+def _item_name_with_count(item: dict, locale: str) -> str:
+    name = format_item(item["Type"], locale)
+    count = int(item.get("Count") or 1)
+    if count > 1:
+        return f"{name} x{count}"
+    return name
 
 
 def format_equipment(equipment: dict | None, locale: str = "en") -> str:
@@ -120,12 +139,73 @@ def format_equipment(equipment: dict | None, locale: str = "en") -> str:
         item = equipment.get(slot_key)
         if not item or not item.get("Type"):
             continue
-        name = format_item(item["Type"], locale)
-        count = int(item.get("Count") or 1)
-        if count > 1:
-            name = f"{name} x{count}"
+        name = _item_name_with_count(item, locale)
         lines.append(f"{slot_label}：{name}")
     return "\n".join(lines)
+
+
+def _item_name_only(item: dict, locale: str) -> str:
+    type_id = item["Type"]
+    name = format_item_name(type_id, locale, with_power=False)
+    count = int(item.get("Count") or 1)
+    if count > 1:
+        return f"{name} x{count}"
+    return name
+
+
+def format_equipment_bilingual_line(
+    item: dict, zh_locale: str = "zh-TW"
+) -> str:
+    """階級一次 + 中文 / 英文，例如：T8.3 長者神聖法杖 / Elder's Holy Staff"""
+    type_id = item["Type"]
+    tier = format_item_tier(type_id)
+    zh = _item_name_only(item, zh_locale)
+    en = _item_name_only(item, "en")
+    names = f"{zh} / {en}"
+    return f"{tier} {names}".strip() if tier else names
+
+
+def format_equipment_bilingual_columns(
+    equipment: dict | None,
+    zh_locale: str = "zh-TW",
+) -> list[str]:
+    """依部位輸出 [中文(含階級), 英文, ...]（不含坐騎），缺件為空字串。"""
+    cells: list[str] = []
+    for slot_key, _slot_label in REGEAR_EQUIPMENT_SLOTS:
+        item = (equipment or {}).get(slot_key)
+        if not item or not item.get("Type"):
+            cells.extend(["", ""])
+            continue
+        tier = format_item_tier(item["Type"])
+        zh = _item_name_only(item, zh_locale)
+        en = _item_name_only(item, "en")
+        cells.append(f"{tier} {zh}".strip() if tier else zh)
+        cells.append(en)
+    return cells
+
+
+def format_equipment_bilingual_text(
+    equipment: dict | None,
+    zh_locale: str = "zh-TW",
+) -> str:
+    """Discord 用：每件一行「階級 中文 / 英文」，不含部位標籤與坐騎。"""
+    if not equipment:
+        return ""
+    lines: list[str] = []
+    for slot_key, _slot_label in REGEAR_EQUIPMENT_SLOTS:
+        item = equipment.get(slot_key)
+        if not item or not item.get("Type"):
+            continue
+        lines.append(format_equipment_bilingual_line(item, zh_locale))
+    return "\n".join(lines)
+
+
+def equipment_bilingual_header() -> list[str]:
+    headers: list[str] = []
+    for _slot_key, slot_label in REGEAR_EQUIPMENT_SLOTS:
+        headers.append(f"{slot_label}中文")
+        headers.append(f"{slot_label}英文")
+    return headers
 
 
 def _guild_line(name: str, guild: str, alliance: str) -> str:
@@ -163,13 +243,14 @@ def _parse_kill(data: dict, kill_id: int, locale: str = "en") -> KillInfo:
     area_key = data.get("KillArea") or ""
     kill_area = KILL_AREA_LABELS.get(area_key, area_key or "未知")
 
+    victim_equipment = victim.get("Equipment")
     return KillInfo(
         kill_id=kill_id,
         victim_name=victim.get("Name") or "未知",
         victim_guild=victim.get("GuildName") or "",
         victim_alliance=victim.get("AllianceName") or "",
         victim_ip=float(victim.get("AverageItemPower") or 0),
-        victim_equipment=format_equipment(victim.get("Equipment"), locale),
+        victim_equipment=format_equipment(victim_equipment, locale),
         killer_name=killer.get("Name") or "未知",
         killer_guild=killer.get("GuildName") or "",
         killer_alliance=killer.get("AllianceName") or "",
@@ -179,6 +260,7 @@ def _parse_kill(data: dict, kill_id: int, locale: str = "en") -> KillInfo:
         kill_area=kill_area,
         timestamp=timestamp,
         participants=int(data.get("numberOfParticipants") or 0),
+        victim_equipment_raw=victim_equipment if isinstance(victim_equipment, dict) else None,
     )
 
 

@@ -25,19 +25,43 @@ https://discord.com/api/oauth2/authorize?client_id=你的CLIENT_ID&permissions=2
 ## 設定
 
 1. 到 [Discord Developer Portal](https://discord.com/developers/applications) 建立 Bot
-2. **Bot** 分頁 → 開啟 **Message Content Intent**
+2. **Bot** 分頁 → 開啟 **Message Content Intent** 與 **Server Members Intent**（依死者名標記成員）
 3. 使用上方邀請連結將 Bot 加入伺服器
-4. 複製 `.env.example` 為 `.env`，填入 `DISCORD_TOKEN`
+4. 複製 `.env.example` 為 `.env`，填入 `DISCORD_TOKEN`  
+   並將 Regear 試算表分享給 Service Account（編輯者）
 
 ```env
 DISCORD_TOKEN=你的Bot_Token
 DEATH_LINK_REPLY=無法取得死亡資訊
 ITEM_LOCALE=zh-TW
+GOOGLE_SHEET_ID_REGEAR=你的Regear試算表ID
 ```
 
 `DEATH_LINK_REPLY` 為 API 查詢失敗時的備用文字。
 
 `ITEM_LOCALE` 為新伺服器的預設裝備語言（`en`、`zh-TW`、`zh-CN`），預設 `zh-TW`。
+
+`GOOGLE_SHEET_ID_REGEAR` 為 Regear 申請與 Discord↔遊戲名綁定用的試算表。
+
+## Regear 申請
+
+| 指令 | 說明 |
+|------|------|
+| `/regear` | 貼上死亡連結申請（須 24 小時內、Kill ID 未申請過、申請人=死者） |
+| `/bindname` | 綁定 Albion 遊戲名稱（寫入試算表 `bindings` 分頁） |
+| `/mybind` | 查看自己目前綁定 |
+| `/setregearchannel` | 設定申請成功後轉發的頻道（當日日期討論串） |
+| `/clearregearchannel` | 取消轉發頻道 |
+| `/regearchannelstatus` | 查看轉發頻道 |
+
+監聽頻道回覆死亡資訊時會：
+
+- 依死者遊戲名 `@` 對應的 Discord 成員（先查 `bindings`，再比對暱稱／顯示名）
+- 附上「申請 Regear」按鈕（與 `/regear` 同一套驗證）
+
+通過後寫入 `GOOGLE_SHEET_ID_REGEAR`，分頁為月份 `YYYY-MM`（例如 `2026-10`）。
+
+名稱比對：有綁定則以綁定為準；無綁定則用 Discord 暱稱／顯示名。不符時會引導執行 `/bindname`。
 
 ## 綁定監聽與回覆頻道
 

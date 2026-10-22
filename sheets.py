@@ -10,6 +10,8 @@ from typing import Literal
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+from albion_kill import equipment_bilingual_header
+
 PartyId = Literal["party1", "party2", "party3", "party4"]
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -263,4 +265,192 @@ class GoogleSheetClient:
         self._service.spreadsheets().batchUpdate(
             spreadsheetId=self.spreadsheet_id,
             body={"requests": [{"deleteSheet": {"sheetId": sheet_id}}]},
+        ).execute()
+
+
+BINDINGS_SHEET = "bindings"
+
+BINDINGS_HEADER = [
+    "Discord User ID",
+    "Discord 顯示名",
+    "遊戲名稱",
+    "更新時間",
+]
+
+REGEAR_HEADER = [
+    "申請時間",
+    "Discord User ID",
+    "Discord 名",
+    "遊戲名",
+    "Kill ID",
+    "死者",
+    "擊殺者",
+    "死者IP",
+    "擊殺者IP",
+    *equipment_bilingual_header(),
+    "Fame",
+    "區域",
+    "死亡時間",
+    "官方連結",
+]
+
+
+class RegearSheetClient(GoogleSheetClient):
+    """Regear 試算表：bindings + 月份分頁。"""
+
+    def ensure_bindings_sheet(self) -> None:
+        if self.sheet_exists(BINDINGS_SHEET):
+            return
+        self._service.spreadsheets().batchUpdate(
+            spreadsheetId=self.spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "addSheet": {
+                            "properties": {"title": BINDINGS_SHEET},
+                        }
+                    }
+                ]
+            },
+        ).execute()
+        self._service.spreadsheets().values().update(
+            spreadsheetId=self.spreadsheet_id,
+            range=f"'{BINDINGS_SHEET}'!A1",
+            valueInputOption="USER_ENTERED",
+            body={"values": [BINDINGS_HEADER]},
+        ).execute()
+
+    def ensure_month_sheet(self, sheet_name: str) -> None:
+        if not self.sheet_exists(sheet_name):
+            self._service.spreadsheets().batchUpdate(
+                spreadsheetId=self.spreadsheet_id,
+                body={
+                    "requests": [
+                        {
+                            "addSheet": {
+                                "properties": {"title": sheet_name},
+                            }
+                        }
+                    ]
+                },
+            ).execute()
+        # 新建或既有分頁都寫入最新表頭（含各部位英文／中文欄）
+        self._service.spreadsheets().values().update(
+            spreadsheetId=self.spreadsheet_id,
+            range=f"'{sheet_name}'!A1",
+            valueInputOption="USER_ENTERED",
+            body={"values": [REGEAR_HEADER]},
+        ).execute()
+
+    def get_binding(self, discord_user_id: int) -> str | None:
+        self.ensure_bindings_sheet()
+        result = (
+            self._service.spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"'{BINDINGS_SHEET}'!A:C",
+            )
+            .execute()
+        )
+        rows = result.get("values") or []
+        uid = str(discord_user_id)
+        for row in rows[1:]:
+            if not row:
+                continue
+            if str(row[0]).strip() == uid and len(row) >= 3 and row[2].strip():
+                return row[2].strip()
+        return None
+
+    def get_discord_ids_for_game_name(self, game_name: str) -> list[int]:
+        self.ensure_bindings_sheet()
+        result = (
+            self._service.spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"'{BINDINGS_SHEET}'!A:C",
+            )
+            .execute()
+        )
+        rows = result.get("values") or []
+        target = game_name.strip().casefold()
+        found: list[int] = []
+        for row in rows[1:]:
+            if len(row) < 3:
+                continue
+            if str(row[2]).strip().casefold() != target:
+                continue
+            uid_str = str(row[0]).strip()
+            if uid_str.isdigit():
+                found.append(int(uid_str))
+        return found
+
+    def upsert_binding(
+        self, discord_user_id: int, discord_display: str, game_name: str, updated_at: str
+    ) -> None:
+        self.ensure_bindings_sheet()
+        result = (
+            self._service.spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"'{BINDINGS_SHEET}'!A:A",
+            )
+            .execute()
+        )
+        rows = result.get("values") or []
+        uid = str(discord_user_id)
+        row_index: int | None = None
+        for i, row in enumerate(rows):
+            if i == 0:
+                continue
+            if row and str(row[0]).strip() == uid:
+                row_index = i + 1
+                break
+
+        values = [[uid, discord_display, game_name.strip(), updated_at]]
+        if row_index is not None:
+            self._service.spreadsheets().values().update(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"'{BINDINGS_SHEET}'!A{row_index}:D{row_index}",
+                valueInputOption="USER_ENTERED",
+                body={"values": values},
+            ).execute()
+        else:
+            self._service.spreadsheets().values().append(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"'{BINDINGS_SHEET}'!A:D",
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body={"values": values},
+            ).execute()
+
+    def kill_id_exists(self, kill_id: int, sheet_names: list[str]) -> bool:
+        target = str(kill_id)
+        for sheet_name in sheet_names:
+            if not self.sheet_exists(sheet_name):
+                continue
+            result = (
+                self._service.spreadsheets()
+                .values()
+                .get(
+                    spreadsheetId=self.spreadsheet_id,
+                    range=f"'{sheet_name}'!E:E",
+                )
+                .execute()
+            )
+            for row in result.get("values") or []:
+                if row and str(row[0]).strip() == target:
+                    return True
+        return False
+
+    def append_regear_row(self, sheet_name: str, row: list[str]) -> None:
+        self.ensure_month_sheet(sheet_name)
+        self._service.spreadsheets().values().append(
+            spreadsheetId=self.spreadsheet_id,
+            range=f"'{sheet_name}'!A1",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row]},
         ).execute()

@@ -173,7 +173,15 @@ def _with_power_prefix(type_id: str, name: str) -> str:
     return f"P{power} {name}"
 
 
-def format_item_name(type_id: str, locale: str = "en") -> str:
+def format_item_tier(type_id: str) -> str:
+    """例如 T8.3（階級.附魔）。"""
+    match = re.match(r"T(\d)_.*?(?:@(\d))?$", type_id)
+    if not match:
+        return ""
+    return f"T{match.group(1)}.{match.group(2) or '0'}"
+
+
+def format_item_name(type_id: str, locale: str = "en", *, with_power: bool = True) -> str:
     base, _, _enchant = type_id.partition("@")
     name: str | None = None
     if locale != "en":
@@ -184,4 +192,6 @@ def format_item_name(type_id: str, locale: str = "en") -> str:
         name = format_item_fallback(type_id)
     if locale in TIER_PREFIXES:
         name = _strip_tier_prefix(name, locale)
-    return _with_power_prefix(type_id, name)
+    if with_power:
+        return _with_power_prefix(type_id, name)
+    return name

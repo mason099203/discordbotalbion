@@ -20,7 +20,14 @@ from display_settings import FIELD_LABELS, DisplaySettings
 from item_localization import LOCALE_LABELS, ensure_loaded
 from locale_settings import DEFAULT_LOCALE, locale_label, normalize_locale
 from party import PartySignupView, SignupUserIds, register_createparty
-from sheets import GoogleSheetClient, load_service_account_credentials
+from regear import (
+    RegearApplyView,
+    append_kill_id_footer,
+    format_mention_prefix,
+    register_regear,
+    resolve_mentions_for_victim,
+)
+from sheets import GoogleSheetClient, RegearSheetClient, load_service_account_credentials
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 FALLBACK_MESSAGE = os.getenv("DEATH_LINK_REPLY", "無法取得死亡資訊")
@@ -38,6 +45,9 @@ def parse_spreadsheet_id(raw: str) -> str:
 
 GOOGLE_SHEET_ID = parse_spreadsheet_id(
     os.getenv("GOOGLE_SHEET_ID", "") or os.getenv("googlesheet_id", "")
+)
+GOOGLE_SHEET_ID_REGEAR = parse_spreadsheet_id(
+    os.getenv("GOOGLE_SHEET_ID_REGEAR", "")
 )
 
 URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
@@ -121,6 +131,7 @@ class GuildConfig:
         self._monitor: dict[int, MonitorSetup] = {}
         self._display: dict[int, DisplaySettings] = {}
         self._locale: dict[int, str] = {}
+        self._regear_channel: dict[int, int] = {}
         self.load()
 
     def load(self) -> None:
@@ -154,6 +165,9 @@ class GuildConfig:
                 self._locale[int(k)] = normalize_locale(v)
             except ValueError:
                 continue
+        self._regear_channel = {
+            int(k): int(v) for k, v in data.get("regear_channel", {}).items()
+        }
 
     def save(self) -> None:
         self.path.write_text(
@@ -170,6 +184,9 @@ class GuildConfig:
                         str(k): v.to_dict() for k, v in self._display.items()
                     },
                     "locale": {str(k): v for k, v in self._locale.items()},
+                    "regear_channel": {
+                        str(k): v for k, v in self._regear_channel.items()
+                    },
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -271,6 +288,20 @@ class GuildConfig:
         self.save()
         return locale
 
+    def get_regear_channel_id(self, guild_id: int) -> int | None:
+        return self._regear_channel.get(guild_id)
+
+    def set_regear_channel(self, guild_id: int, channel_id: int) -> None:
+        self._regear_channel[guild_id] = channel_id
+        self.save()
+
+    def clear_regear_channel(self, guild_id: int) -> bool:
+        if guild_id not in self._regear_channel:
+            return False
+        del self._regear_channel[guild_id]
+        self.save()
+        return True
+
 
 class SettingsView(discord.ui.View):
     def __init__(self, guild_id: int, config: GuildConfig):
@@ -337,12 +368,24 @@ class DeathLinkBot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
+        intents.members = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.config = GuildConfig(CONFIG_PATH)
         self.sheets = GoogleSheetClient(GOOGLE_SHEET_ID)
+        self.regear_sheets: RegearSheetClient | None = (
+            RegearSheetClient(GOOGLE_SHEET_ID_REGEAR)
+            if GOOGLE_SHEET_ID_REGEAR
+            else None
+        )
         self.active_views: dict[int, PartySignupView] = {}
         self.signup_user_ids: SignupUserIds = {}
+
+    def get_locale(self, guild_id: int) -> str:
+        return self.config.get_locale(guild_id)
+
+    def get_regear_channel_id(self, guild_id: int) -> int | None:
+        return self.config.get_regear_channel_id(guild_id)
 
     def clear_signup_user_ids(self, sheet_name: str) -> None:
         for key in list(self.signup_user_ids):
@@ -360,6 +403,13 @@ class DeathLinkBot(discord.Client):
 
     async def setup_hook(self) -> None:
         await asyncio.to_thread(ensure_loaded)
+        self.add_view(RegearApplyView(self))
+        if self.regear_sheets is not None:
+            try:
+                await asyncio.to_thread(self.regear_sheets.ensure_bindings_sheet)
+                print("Regear bindings 分頁已就緒")
+            except Exception as e:  # noqa: BLE001
+                print(f"警告：無法初始化 Regear bindings 分頁：{e}")
         await self.tree.sync()
         print(f"已同步 {len(self.tree.get_commands())} 個 slash 指令")
 
@@ -404,13 +454,28 @@ class DeathLinkBot(discord.Client):
         if info:
             text = format_kill_message(info, link.official_url, settings)
             if text:
-                await reply_channel.send(text)  # type: ignore[union-attr]
+                mention_prefix = ""
+                view = None
+                if self.regear_sheets is not None:
+                    try:
+                        members = await resolve_mentions_for_victim(
+                            message.guild, self.regear_sheets, info.victim_name
+                        )
+                        mention_prefix = format_mention_prefix(members)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"警告：依死者名標記成員失敗：{e}")
+                    text = append_kill_id_footer(text, link.kill_id)
+                    view = RegearApplyView(self)
+                await reply_channel.send(  # type: ignore[union-attr]
+                    f"{mention_prefix}{text}", view=view
+                )
         else:
             await reply_channel.send(FALLBACK_MESSAGE)  # type: ignore[union-attr]
 
 
 bot = DeathLinkBot()
 register_createparty(bot)
+register_regear(bot)
 
 
 settings_group = app_commands.Group(
@@ -666,11 +731,75 @@ async def monitorstatus(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(msg, ephemeral=True)
 
 
+@bot.tree.command(
+    name="setregearchannel",
+    description="設定 Regear 申請轉發頻道（以當日日期建立／使用討論串）",
+)
+@app_commands.describe(channel="要轉發的文字頻道（未指定則為目前頻道）")
+async def setregearchannel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel | None = None,
+) -> None:
+    if channel is not None:
+        channel_id = channel.id
+    else:
+        channel_id = resolve_text_channel_id(interaction.channel)  # type: ignore[arg-type]
+        if channel_id is None:
+            await interaction.response.send_message(
+                "請在**文字頻道**內執行，或指定要轉發的頻道。",
+                ephemeral=True,
+            )
+            return
+
+    bot.config.set_regear_channel(interaction.guild_id, channel_id)  # type: ignore[arg-type]
+    ref = channel_ref(bot, channel_id)
+    await interaction.response.send_message(
+        f"已設定 Regear 轉發頻道：{ref}\n"
+        f"申請成功後會發送到當日日期討論串（例如 `2026-10-22`）。",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="clearregearchannel",
+    description="取消 Regear 申請轉發頻道",
+)
+async def clearregearchannel(interaction: discord.Interaction) -> None:
+    if not bot.config.clear_regear_channel(interaction.guild_id):  # type: ignore[arg-type]
+        await interaction.response.send_message(
+            "尚未設定 Regear 轉發頻道。", ephemeral=True
+        )
+        return
+    await interaction.response.send_message(
+        "已取消 Regear 轉發頻道。", ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="regearchannelstatus",
+    description="查看 Regear 申請轉發頻道",
+)
+async def regearchannelstatus(interaction: discord.Interaction) -> None:
+    channel_id = bot.config.get_regear_channel_id(interaction.guild_id)  # type: ignore[arg-type]
+    if channel_id is None:
+        await interaction.response.send_message(
+            "尚未設定。請用 `/setregearchannel` 指定轉發頻道。",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.send_message(
+        f"Regear 轉發頻道：{channel_ref(bot, channel_id)}",
+        ephemeral=True,
+    )
+
+
 def main() -> None:
     if not DISCORD_TOKEN:
         raise SystemExit("請在 .env 設定 DISCORD_TOKEN")
     if not GOOGLE_SHEET_ID:
         raise SystemExit("請在 .env 設定 GOOGLE_SHEET_ID")
+    if not GOOGLE_SHEET_ID_REGEAR:
+        print("警告：未設定 GOOGLE_SHEET_ID_REGEAR，Regear 功能將停用")
     try:
         load_service_account_credentials()
     except (FileNotFoundError, json.JSONDecodeError) as e:
@@ -679,11 +808,11 @@ def main() -> None:
         bot.run(DISCORD_TOKEN)
     except discord.PrivilegedIntentsRequired:
         raise SystemExit(
-            "\n❌ 需要在 Discord Developer Portal 開啟 Message Content Intent：\n"
+            "\n❌ 需要在 Discord Developer Portal 開啟 Privileged Intents：\n"
             "   1. https://discord.com/developers/applications\n"
             "   2. 選擇你的 Application（Token 必須來自同一個）\n"
             "   3. 左側 Bot → Privileged Gateway Intents\n"
-            "   4. 開啟「MESSAGE CONTENT INTENT」\n"
+            "   4. 開啟「MESSAGE CONTENT INTENT」與「SERVER MEMBERS INTENT」\n"
             "   5. Save Changes 後重新執行 python bot.py\n"
         ) from None
 
