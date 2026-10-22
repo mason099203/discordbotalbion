@@ -320,6 +320,23 @@ async def process_regear_application(
             _regear_active = max(0, _regear_active - 1)
 
 
+def _sheet_network_error_message(exc: BaseException) -> str | None:
+    import ssl
+
+    if isinstance(exc, ssl.SSLError):
+        return "連線 Google Sheet 暫時失敗（SSL），請稍後再試。"
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return "連線 Google Sheet 暫時失敗，請稍後再試。"
+    text = str(exc).lower()
+    if (
+        "ssl" in text
+        or "decryption failed" in text
+        or "bad record mac" in text
+    ):
+        return "連線 Google Sheet 暫時失敗（SSL），請稍後再試。"
+    return None
+
+
 async def _process_regear_application_inner(
     *,
     sheets: RegearSheetClient,
@@ -347,41 +364,44 @@ async def _process_regear_application_inner(
             f"死亡時間已超過 24 小時（死亡：{format_ts(death_ts)}），無法申請。",
         )
 
-    if await asyncio.to_thread(
-        sheets.kill_id_exists, kill_id, nearby_month_sheets(now)
-    ):
-        return RegearResult(False, f"Kill ID `{kill_id}` 已申請過，不可重複申請。")
+    try:
+        if await asyncio.to_thread(
+            sheets.kill_id_exists, kill_id, nearby_month_sheets(now)
+        ):
+            return RegearResult(False, f"Kill ID `{kill_id}` 已申請過，不可重複申請。")
 
-    victim = info.victim_name.strip()
-    bound = await asyncio.to_thread(sheets.get_binding, member.id)
-    if bound:
-        if bound.strip().casefold() != victim.casefold():
+        victim = info.victim_name.strip()
+        bound = await asyncio.to_thread(sheets.get_binding, member.id)
+        if bound:
+            if bound.strip().casefold() != victim.casefold():
+                return RegearResult(
+                    False,
+                    f"綁定遊戲名 **{bound.strip()}** 與死者 **{victim}** 不符。\n"
+                    f"請用 `/bindname {victim}` 更正後再申請。",
+                )
+        elif not member_matches_game_name(member, victim):
             return RegearResult(
                 False,
-                f"綁定遊戲名 **{bound.strip()}** 與死者 **{victim}** 不符。\n"
-                f"請用 `/bindname {victim}` 更正後再申請。",
+                f"無法確認你是死者 **{victim}**。\n"
+                f"請先執行 `/bindname {victim}` 綁定遊戲名稱後再申請。",
             )
-    elif not member_matches_game_name(member, victim):
-        return RegearResult(
-            False,
-            f"無法確認你是死者 **{victim}**。\n"
-            f"請先執行 `/bindname {victim}` 綁定遊戲名稱後再申請。",
-        )
 
-    sheet_name = month_sheet_name(now)
-    official_url = to_official_kill_url(kill_id)
-    zh_locale = locale if locale.startswith("zh") else "zh-TW"
-    row = build_regear_row(
-        now=now,
-        member=member,
-        game_name=victim,
-        info=info,
-        official_url=official_url,
-        zh_locale=zh_locale,
-    )
-    try:
+        sheet_name = month_sheet_name(now)
+        official_url = to_official_kill_url(kill_id)
+        zh_locale = locale if locale.startswith("zh") else "zh-TW"
+        row = build_regear_row(
+            now=now,
+            member=member,
+            game_name=victim,
+            info=info,
+            official_url=official_url,
+            zh_locale=zh_locale,
+        )
         await asyncio.to_thread(sheets.append_regear_row, sheet_name, row)
     except Exception as e:  # noqa: BLE001
+        soft = _sheet_network_error_message(e)
+        if soft:
+            return RegearResult(False, soft)
         return RegearResult(False, f"寫入 Google Sheet 失敗：{e}")
 
     equip_text = format_equipment_bilingual_text(

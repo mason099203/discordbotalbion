@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
+import time
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 from albion_kill import equipment_bilingual_header
 
@@ -105,6 +108,40 @@ def load_service_account_credentials(
             "或提供 GOOGLE_CREDENTIALS 檔案路徑"
         )
     return service_account.Credentials.from_service_account_file(path, scopes=SCOPES)
+
+
+def _patch_http_request_retries() -> None:
+    """為 googleapiclient 的 execute 加上 SSL／暫時錯誤重試。"""
+    from googleapiclient.http import HttpRequest
+
+    original = HttpRequest.execute
+    if getattr(original, "_albion_retry_patched", False):
+        return
+
+    def execute(self: Any, *args: Any, **kwargs: Any) -> Any:
+        last_exc: BaseException | None = None
+        retries = 3
+        for attempt in range(retries):
+            try:
+                return original(self, *args, **kwargs)
+            except HttpError as exc:
+                last_exc = exc
+                status = getattr(exc.resp, "status", None)
+                if status not in (429, 500, 502, 503, 504) or attempt + 1 >= retries:
+                    raise
+            except (ssl.SSLError, ConnectionError, TimeoutError, OSError) as exc:
+                last_exc = exc
+                if attempt + 1 >= retries:
+                    raise
+            time.sleep(0.5 * (2**attempt))
+        assert last_exc is not None
+        raise last_exc
+
+    execute._albion_retry_patched = True  # type: ignore[attr-defined]
+    HttpRequest.execute = execute  # type: ignore[method-assign]
+
+
+_patch_http_request_retries()
 
 
 class GoogleSheetClient:
