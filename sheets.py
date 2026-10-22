@@ -110,9 +110,13 @@ def load_service_account_credentials(
 class GoogleSheetClient:
     def __init__(self, spreadsheet_id: str, credentials_path: str | None = None):
         creds = load_service_account_credentials(credentials_path)
-        # cache_discovery=False：避免 discovery 文件常駐記憶體
+        # static_discovery=True：用套件內建 discovery，不依賴外網下載
         self._service = build(
-            "sheets", "v4", credentials=creds, cache_discovery=False
+            "sheets",
+            "v4",
+            credentials=creds,
+            cache_discovery=False,
+            static_discovery=True,
         )
         self.spreadsheet_id = spreadsheet_id
 
